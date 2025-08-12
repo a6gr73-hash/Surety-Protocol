@@ -1,8 +1,5 @@
-It's 3:14 PM. No problem at all—getting used to Git is a journey, and IntelliJ has excellent built-in Git tools that can make it much easier over time.
-
-For now, here is the complete project brief we've built. This document is the culmination of our entire design process and can serve as the foundational "blueprint" in your new /docs folder.
-
 Project Brief: The Surety Protocol (SRT)
+
 1. Objective
 To create a highly scalable, decentralized payment protocol that provides instant, economically guaranteed transactions for merchants, enabling stablecoins to be used for global commerce at a scale and efficiency greater than legacy payment rails like Visa.
 
