@@ -1,97 +1,173 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
-import { Surety, MockOracle } from "../typechain-types";
+import { Surety, CollateralVault } from "../typechain-types";
 
-describe("Surety Token Staking", function () {
+describe("CollateralVault Staking", function () {
     let suretyToken: Surety;
-    let mockOracle: MockOracle;
+    let vault: CollateralVault;
     let owner: SignerWithAddress;
     let addr1: SignerWithAddress;
     let addr2: SignerWithAddress;
 
-    // The oracle price of 1 SRT in USD, with 8 decimals
-    const initialSrtPrice = ethers.parseUnits("1", 8); // $1.00
-
     beforeEach(async function () {
         [owner, addr1, addr2] = await ethers.getSigners();
 
-        // Deploy the MockOracle first
-        const MockOracleFactory = await ethers.getContractFactory("MockOracle");
-        mockOracle = await MockOracleFactory.deploy(initialSrtPrice);
-        await mockOracle.waitForDeployment();
-        
-        // Deploy the Surety contract with the MockOracle's address
+        // Deploy the Surety token and mint the initial supply to the owner
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        suretyToken = await SuretyFactory.deploy(mockOracle.target);
+        const initialSupply = ethers.parseEther("1000000");
+        suretyToken = await SuretyFactory.deploy(initialSupply);
         await suretyToken.waitForDeployment();
+
+        // Deploy the CollateralVault
+        const VaultFactory = await ethers.getContractFactory("CollateralVault");
+        vault = await VaultFactory.deploy(await suretyToken.getAddress());
+        await vault.waitForDeployment();
+
+        // Transfer some SRT to addr1 for testing
+        await suretyToken.transfer(addr1.address, ethers.parseEther("1000"));
     });
 
-    it("Should deploy the contract with the correct oracle address", async function () {
-        // This is the correct way to call the getter function
-        expect(await suretyToken.oracle()).to.equal(mockOracle.target);
+    describe("Basic Deposit and Withdraw", function () {
+        it("Should deploy the vault with the correct token address", async function () {
+            expect(await vault.SRT()).to.equal(await suretyToken.getAddress());
+        });
+
+        it("Should allow a user to deposit tokens and update unlocked stake", async function () {
+            const depositAmount = ethers.parseEther("500");
+
+            // User must approve the vault to spend their tokens
+            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(addr1).deposit(depositAmount);
+
+            // Check user's SRT balance and the vault's record of their stake
+            expect(await suretyToken.balanceOf(addr1.address)).to.equal(ethers.parseEther("500"));
+            expect(await vault.stakes(addr1.address)).to.equal(depositAmount);
+        });
+
+        it("Should emit a Deposited event on successful deposit", async function () {
+            const depositAmount = ethers.parseEther("100");
+            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
+
+            await expect(vault.connect(addr1).deposit(depositAmount))
+                .to.emit(vault, "Deposited")
+                .withArgs(addr1.address, depositAmount);
+        });
+
+        it("Should reject a deposit of 0 tokens", async function () {
+            await expect(vault.connect(addr1).deposit(0)).to.be.revertedWith("Deposit must be > 0");
+        });
+
+        it("Should allow a user to withdraw their unlocked stake", async function () {
+            const depositAmount = ethers.parseEther("400");
+            const withdrawAmount = ethers.parseEther("150");
+
+            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(addr1).deposit(depositAmount);
+            await vault.connect(addr1).withdraw(withdrawAmount);
+
+            // User started with 1000, deposited 400 (600 left), withdrew 150 (750 left)
+            expect(await suretyToken.balanceOf(addr1.address)).to.equal(ethers.parseEther("750"));
+            // Vault stake was 400, withdrew 150 (250 left)
+            expect(await vault.stakes(addr1.address)).to.equal(ethers.parseEther("250"));
+        });
+
+        it("Should reject withdrawing more than the available unlocked stake", async function () {
+            const depositAmount = ethers.parseEther("200");
+            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(addr1).deposit(depositAmount);
+
+            const overdrawAmount = ethers.parseEther("201");
+            await expect(vault.connect(addr1).withdraw(overdrawAmount)).to.be.revertedWith(
+                "Insufficient unlocked stake"
+            );
+        });
     });
 
-    it("Should allow a user to stake tokens and update the staked balance", async function () {
-        // Owner transfers some tokens to addr1 to have something to stake
-        const initialTransferAmount = ethers.parseEther("1000"); // 1000 SRT
-        await suretyToken.transfer(addr1.address, initialTransferAmount);
-        
-        // Check initial balance and staked balance of addr1
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(initialTransferAmount);
-        expect(await suretyToken.stakedBalances(addr1.address)).to.equal(0);
-        
-        // Addr1 stakes 500 tokens
-        const stakeAmount = ethers.parseEther("500"); // 500 SRT
-        await suretyToken.connect(addr1).stake(stakeAmount);
-        
-        // Check new balances
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(initialTransferAmount - stakeAmount);
-        expect(await suretyToken.stakedBalances(addr1.address)).to.equal(stakeAmount);
-    });
+    describe("Locking, Releasing, and Slashing Logic", function () {
+        let settlementContract: SignerWithAddress;
 
-    it("Should not allow a user to stake more tokens than they own", async function () {
-        const initialTransferAmount = ethers.parseEther("100");
-        await suretyToken.transfer(addr1.address, initialTransferAmount);
+        beforeEach(async function () {
+            // Designate addr2 as the mock settlement contract for these tests
+            settlementContract = addr2;
 
-        const stakeAmount = ethers.parseEther("200");
-        
-        // Expect the transaction to be reverted with a custom error
-        await expect(suretyToken.connect(addr1).stake(stakeAmount)).to.be.revertedWithCustomError(
-            suretyToken, 
-            "ERC20InsufficientBalance"
-        );
-    });
+            // The owner must first authorize the settlement contract address in the vault
+            await vault.connect(owner).setSettlementContract(settlementContract.address);
 
-    it("Should allow a user to unstake tokens and update the balances", async function () {
-        // Owner transfers some tokens to addr1 and addr1 stakes them
-        const initialTransferAmount = ethers.parseEther("1000");
-        await suretyToken.transfer(addr1.address, initialTransferAmount);
-        await suretyToken.connect(addr1).stake(ethers.parseEther("500"));
+            // Pre-load addr1's account with funds for testing
+            const depositAmount = ethers.parseEther("500");
+            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(addr1).deposit(depositAmount);
+        });
 
-        // Check balances before unstaking
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(ethers.parseEther("500"));
-        expect(await suretyToken.stakedBalances(addr1.address)).to.equal(ethers.parseEther("500"));
+        it("Should allow the authorized settlement contract to lock a user's stake", async function () {
+            const lockAmount = ethers.parseEther("300");
 
-        // Addr1 unstakes 200 tokens
-        const unstakeAmount = ethers.parseEther("200");
-        await suretyToken.connect(addr1).unstake(unstakeAmount);
+            await vault.connect(settlementContract).lock(addr1.address, lockAmount);
 
-        // Check balances after unstaking
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(ethers.parseEther("700"));
-        expect(await suretyToken.stakedBalances(addr1.address)).to.equal(ethers.parseEther("300"));
-    });
+            expect(await vault.stakes(addr1.address)).to.equal(ethers.parseEther("200"));
+            expect(await vault.lockedStakes(addr1.address)).to.equal(lockAmount);
+        });
 
-    it("Should not allow a user to unstake more tokens than they have staked", async function () {
-        // Owner transfers some tokens to addr1 and addr1 stakes them
-        const initialTransferAmount = ethers.parseEther("1000");
-        await suretyToken.transfer(addr1.address, initialTransferAmount);
-        await suretyToken.connect(addr1).stake(ethers.parseEther("500"));
-        
-        // Addr1 tries to unstake 600 tokens, which is more than their staked balance
-        const unstakeAmount = ethers.parseEther("600");
-        await expect(suretyToken.connect(addr1).unstake(unstakeAmount)).to.be.revertedWith(
-            "Insufficient staked balance"
-        );
+        it("Should reject lock attempts from non-authorized addresses", async function () {
+            const lockAmount = ethers.parseEther("300");
+
+            // addr1 (a random user) cannot call lock
+            await expect(vault.connect(addr1).lock(addr1.address, lockAmount))
+                .to.be.revertedWith("Caller is not the settlement contract");
+        });
+
+        it("Should prevent a user from withdrawing funds that are locked", async function () {
+            const lockAmount = ethers.parseEther("400");
+            await vault.connect(settlementContract).lock(addr1.address, lockAmount);
+
+            // addr1 now has 100 unlocked and 400 locked.
+            // An attempt to withdraw 101 should fail.
+            await expect(vault.connect(addr1).withdraw(ethers.parseEther("101")))
+                .to.be.revertedWith("Insufficient unlocked stake");
+            
+            // However, withdrawing the 100 unlocked should succeed.
+            await expect(vault.connect(addr1).withdraw(ethers.parseEther("100")))
+                .to.not.be.reverted;
+
+            expect(await vault.stakes(addr1.address)).to.equal(0);
+        });
+
+        it("Should allow the settlement contract to release a locked stake", async function () {
+            const lockAmount = ethers.parseEther("400");
+            const releaseAmount = ethers.parseEther("150");
+
+            await vault.connect(settlementContract).lock(addr1.address, lockAmount);
+
+            // Pre-release state: 100 unlocked, 400 locked
+            expect(await vault.stakes(addr1.address)).to.equal(ethers.parseEther("100"));
+            expect(await vault.lockedStakes(addr1.address)).to.equal(lockAmount);
+
+            await vault.connect(settlementContract).release(addr1.address, releaseAmount);
+
+            // Post-release state: 250 unlocked, 250 locked
+            expect(await vault.stakes(addr1.address)).to.equal(ethers.parseEther("250"));
+            expect(await vault.lockedStakes(addr1.address)).to.equal(ethers.parseEther("250"));
+        });
+
+        it("Should allow the settlement contract to slash a locked stake", async function () {
+            const lockAmount = ethers.parseEther("350");
+            const slashAmount = ethers.parseEther("200");
+
+            await vault.connect(settlementContract).lock(addr1.address, lockAmount);
+            
+            const settlementBalanceBefore = await suretyToken.balanceOf(settlementContract.address);
+
+            // Slash the funds
+            await vault.connect(settlementContract).slash(addr1.address, slashAmount);
+
+            // User's locked stake should decrease, unlocked should be untouched
+            expect(await vault.lockedStakes(addr1.address)).to.equal(ethers.parseEther("150"));
+            expect(await vault.stakes(addr1.address)).to.equal(ethers.parseEther("150"));
+            
+            // The slashed tokens should be transferred to the settlement contract
+            const settlementBalanceAfter = await suretyToken.balanceOf(settlementContract.address);
+            expect(settlementBalanceAfter).to.equal(settlementBalanceBefore + slashAmount);
+        });
     });
 });
