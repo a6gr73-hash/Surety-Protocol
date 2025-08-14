@@ -2,74 +2,148 @@
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
+/**
+ * @title CollateralVault
+ * @notice Holds collateral for instant settlement. Supports SRT and USDC staking.
+ *         Settlement contract (set by owner) can lock, release, and slash.
+ */
 contract CollateralVault is ReentrancyGuard, Ownable {
     IERC20 public immutable SRT;
+    IERC20 public immutable USDC;
+
     address public settlementContract;
 
-    mapping(address => uint256) public stakes;
-    mapping(address => uint256) public lockedStakes;
+    mapping(address => uint256) public srtStake;
+    mapping(address => uint256) public srtLocked;
+    mapping(address => uint256) public usdcStake;
+    mapping(address => uint256) public usdcLocked;
 
+    // --- Events ---
     event SettlementContractSet(address indexed contractAddress);
-    event Deposited(address indexed user, uint256 amount);
-    event Withdrawn(address indexed user, uint256 amount);
-    event Locked(address indexed user, uint256 amount);
-    event Released(address indexed user, uint256 amount);
-    event Slashed(address indexed user, address indexed beneficiary, uint256 amount);
 
-    modifier onlySettlementContract() {
-        require(msg.sender == settlementContract, "Caller is not the settlement contract");
+    event DepositedSRT(address indexed user, uint256 amount);
+    event WithdrawnSRT(address indexed user, uint256 amount);
+    event LockedSRT(address indexed user, uint256 amount);
+    event ReleasedSRT(address indexed user, uint256 amount);
+    event SlashedSRT(address indexed user, address indexed recipient, uint256 amount);
+
+    event DepositedUSDC(address indexed user, uint256 amount);
+    event WithdrawnUSDC(address indexed user, uint256 amount);
+    event LockedUSDC(address indexed user, uint256 amount);
+    event ReleasedUSDC(address indexed user, uint256 amount);
+    event SlashedUSDC(address indexed user, address indexed recipient, uint256 amount);
+
+    modifier onlySettlement() {
+        require(msg.sender == settlementContract, "not settlement");
         _;
     }
 
-    constructor(IERC20 _token) Ownable(msg.sender) {
-        SRT = _token;
+    // --- Constructor ---
+    constructor(address _srt, address _usdc) {
+        require(_srt != address(0), "SRT=0");
+        require(_usdc != address(0), "USDC=0");
+        SRT = IERC20(_srt);
+        USDC = IERC20(_usdc);
     }
 
-    function setSettlementContract(address _settlementContract) external onlyOwner {
-        require(_settlementContract != address(0), "Invalid address");
-        settlementContract = _settlementContract;
-        emit SettlementContractSet(_settlementContract);
+    // --- Admin: set settlement contract ---
+    function setSettlementContract(address _settlement) external onlyOwner {
+        require(_settlement != address(0), "settlement=0");
+        settlementContract = _settlement;
+        emit SettlementContractSet(_settlement);
     }
 
-    function deposit(uint256 amount) external nonReentrant {
-        require(amount > 0, "Deposit must be > 0");
-        stakes[msg.sender] += amount;
-        require(SRT.transferFrom(msg.sender, address(this), amount), "SRT transfer failed");
-        emit Deposited(msg.sender, amount);
+    // --- SRT functions ---
+    function depositSRT(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        srtStake[msg.sender] += amount;
+        require(SRT.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        emit DepositedSRT(msg.sender, amount);
     }
 
-    function withdraw(uint256 amount) external nonReentrant {
-        require(stakes[msg.sender] >= amount, "Insufficient unlocked stake");
-        stakes[msg.sender] -= amount;
-        require(SRT.transfer(msg.sender, amount), "SRT transfer failed");
-        emit Withdrawn(msg.sender, amount);
+    function withdrawSRT(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        require(srtStake[msg.sender] >= amount, "insufficient SRT");
+        srtStake[msg.sender] -= amount;
+        require(SRT.transfer(msg.sender, amount), "transfer failed");
+        emit WithdrawnSRT(msg.sender, amount);
     }
 
-    function lock(address user, uint256 amount) external nonReentrant onlySettlementContract {
-        require(stakes[user] >= amount, "Insufficient unlocked stake to lock");
-        stakes[user] -= amount;
-        lockedStakes[user] += amount;
-        emit Locked(user, amount);
+    function lockSRT(address user, uint256 amount) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(srtStake[user] >= amount, "insufficient free");
+        srtStake[user] -= amount;
+        srtLocked[user] += amount;
+        emit LockedSRT(user, amount);
     }
 
-    function release(address user, uint256 amount) external nonReentrant onlySettlementContract {
-        require(lockedStakes[user] >= amount, "Insufficient locked stake to release");
-        lockedStakes[user] -= amount;
-        stakes[user] += amount;
-        emit Released(user, amount);
+    function releaseSRT(address user, uint256 amount) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(srtLocked[user] >= amount, "insufficient locked");
+        srtLocked[user] -= amount;
+        srtStake[user] += amount;
+        emit ReleasedSRT(user, amount);
     }
 
-    function slash(address user, uint256 amount) external nonReentrant onlySettlementContract {
-        require(lockedStakes[user] >= amount, "Insufficient locked stake to slash");
-        lockedStakes[user] -= amount;
-        require(SRT.transfer(settlementContract, amount), "Slash transfer failed");
-        emit Slashed(user, settlementContract, amount);
+    function slashSRT(address user, uint256 amount, address recipient) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(recipient != address(0), "recipient=0");
+        require(srtLocked[user] >= amount, "insufficient locked");
+        srtLocked[user] -= amount;
+        require(SRT.transfer(recipient, amount), "slash transfer failed");
+        emit SlashedSRT(user, recipient, amount);
     }
 
-    function totalStakeOf(address user) external view returns (uint256) {
-        return stakes[user] + lockedStakes[user];
+    // --- USDC functions ---
+    function depositUSDC(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        usdcStake[msg.sender] += amount;
+        require(USDC.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        emit DepositedUSDC(msg.sender, amount);
     }
+
+    function withdrawUSDC(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        require(usdcStake[msg.sender] >= amount, "insufficient USDC");
+        usdcStake[msg.sender] -= amount;
+        require(USDC.transfer(msg.sender, amount), "transfer failed");
+        emit WithdrawnUSDC(msg.sender, amount);
+    }
+
+    function lockUSDC(address user, uint256 amount) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(usdcStake[user] >= amount, "insufficient free");
+        usdcStake[user] -= amount;
+        usdcLocked[user] += amount;
+        emit LockedUSDC(user, amount);
+    }
+
+    function releaseUSDC(address user, uint256 amount) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(usdcLocked[user] >= amount, "insufficient locked");
+        usdcLocked[user] -= amount;
+        usdcStake[user] += amount;
+        emit ReleasedUSDC(user, amount);
+    }
+
+    function slashUSDC(address user, uint256 amount, address recipient) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(recipient != address(0), "recipient=0");
+        require(usdcLocked[user] >= amount, "insufficient locked");
+        usdcLocked[user] -= amount;
+        require(USDC.transfer(recipient, amount), "slash transfer failed");
+        emit SlashedUSDC(user, recipient, amount);
+    }
+
+    // --- Views ---
+    function srtFreeOf(address user) external view returns (uint256) { return srtStake[user]; }
+    function srtLockedOf(address user) external view returns (uint256) { return srtLocked[user]; }
+    function srtTotalOf(address user) external view returns (uint256) { return srtStake[user] + srtLocked[user]; }
+
+    function usdcFreeOf(address user) external view returns (uint256) { return usdcStake[user]; }
+    function usdcLockedOf(address user) external view returns (uint256) { return usdcLocked[user]; }
+    function usdcTotalOf(address user) external view returns (uint256) { return usdcStake[user] + usdcLocked[user]; }
 }

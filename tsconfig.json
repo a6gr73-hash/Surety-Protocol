@@ -5,8 +5,15 @@
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
     "strict": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "resolveJsonModule": true
   },
-  "include": ["./test", "./scripts", "./typechain-types", "./artifacts"],
+  "include": [
+    "./scripts",
+    "./test",
+    "./typechain-types",
+    "./artifacts",
+    "./node_modules/@openzeppelin"
+  ],
   "files": ["./hardhat.config.ts"]
 }
