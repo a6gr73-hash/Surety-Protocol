@@ -6,7 +6,7 @@ const config: HardhatUserConfig = {
   solidity: "0.8.20",
   typechain: {
     outDir: "typechain-types",
-    target: "ethers-v6" // <--- match installed @typechain/ethers-v6
+    target: "ethers-v6"
   }
 };
 

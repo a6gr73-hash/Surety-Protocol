@@ -5,11 +5,6 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-/**
- * @title CollateralVault
- * @notice Holds collateral for instant settlement. Supports SRT and USDC staking.
- *         Settlement contract (set by owner) can lock, release, and slash.
- */
 contract CollateralVault is ReentrancyGuard, Ownable {
     IERC20 public immutable SRT;
     IERC20 public immutable USDC;
@@ -20,6 +15,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     mapping(address => uint256) public srtLocked;
     mapping(address => uint256) public usdcStake;
     mapping(address => uint256) public usdcLocked;
+    mapping(address => uint256) public srtStakeTimestamp;
 
     // --- Events ---
     event SettlementContractSet(address indexed contractAddress);
@@ -28,13 +24,21 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     event WithdrawnSRT(address indexed user, uint256 amount);
     event LockedSRT(address indexed user, uint256 amount);
     event ReleasedSRT(address indexed user, uint256 amount);
-    event SlashedSRT(address indexed user, address indexed recipient, uint256 amount);
+    event SlashedSRT(
+        address indexed user,
+        address indexed recipient,
+        uint256 amount
+    );
 
     event DepositedUSDC(address indexed user, uint256 amount);
     event WithdrawnUSDC(address indexed user, uint256 amount);
     event LockedUSDC(address indexed user, uint256 amount);
     event ReleasedUSDC(address indexed user, uint256 amount);
-    event SlashedUSDC(address indexed user, address indexed recipient, uint256 amount);
+    event SlashedUSDC(
+        address indexed user,
+        address indexed recipient,
+        uint256 amount
+    );
 
     modifier onlySettlement() {
         require(msg.sender == settlementContract, "not settlement");
@@ -59,8 +63,16 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     // --- SRT functions ---
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
+        // Set timestamp if first stake
+        if (srtStake[msg.sender] == 0) {
+            srtStakeTimestamp[msg.sender] = block.timestamp;
+        }
+
         srtStake[msg.sender] += amount;
-        require(SRT.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        require(
+            SRT.transferFrom(msg.sender, address(this), amount),
+            "transferFrom failed"
+        );
         emit DepositedSRT(msg.sender, amount);
     }
 
@@ -72,7 +84,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit WithdrawnSRT(msg.sender, amount);
     }
 
-    function lockSRT(address user, uint256 amount) external nonReentrant onlySettlement {
+    function lockSRT(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(srtStake[user] >= amount, "insufficient free");
         srtStake[user] -= amount;
@@ -80,7 +95,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit LockedSRT(user, amount);
     }
 
-    function releaseSRT(address user, uint256 amount) external nonReentrant onlySettlement {
+    function releaseSRT(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(srtLocked[user] >= amount, "insufficient locked");
         srtLocked[user] -= amount;
@@ -88,7 +106,11 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit ReleasedSRT(user, amount);
     }
 
-    function slashSRT(address user, uint256 amount, address recipient) external nonReentrant onlySettlement {
+    function slashSRT(
+        address user,
+        uint256 amount,
+        address recipient
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(recipient != address(0), "recipient=0");
         require(srtLocked[user] >= amount, "insufficient locked");
@@ -101,7 +123,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     function depositUSDC(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         usdcStake[msg.sender] += amount;
-        require(USDC.transferFrom(msg.sender, address(this), amount), "transferFrom failed");
+        require(
+            USDC.transferFrom(msg.sender, address(this), amount),
+            "transferFrom failed"
+        );
         emit DepositedUSDC(msg.sender, amount);
     }
 
@@ -113,7 +138,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit WithdrawnUSDC(msg.sender, amount);
     }
 
-    function lockUSDC(address user, uint256 amount) external nonReentrant onlySettlement {
+    function lockUSDC(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(usdcStake[user] >= amount, "insufficient free");
         usdcStake[user] -= amount;
@@ -121,7 +149,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit LockedUSDC(user, amount);
     }
 
-    function releaseUSDC(address user, uint256 amount) external nonReentrant onlySettlement {
+    function releaseUSDC(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(usdcLocked[user] >= amount, "insufficient locked");
         usdcLocked[user] -= amount;
@@ -129,7 +160,11 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit ReleasedUSDC(user, amount);
     }
 
-    function slashUSDC(address user, uint256 amount, address recipient) external nonReentrant onlySettlement {
+    function slashUSDC(
+        address user,
+        uint256 amount,
+        address recipient
+    ) external nonReentrant onlySettlement {
         require(amount > 0, "amount=0");
         require(recipient != address(0), "recipient=0");
         require(usdcLocked[user] >= amount, "insufficient locked");
@@ -139,11 +174,27 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     }
 
     // --- Views ---
-    function srtFreeOf(address user) external view returns (uint256) { return srtStake[user]; }
-    function srtLockedOf(address user) external view returns (uint256) { return srtLocked[user]; }
-    function srtTotalOf(address user) external view returns (uint256) { return srtStake[user] + srtLocked[user]; }
+    function srtFreeOf(address user) external view returns (uint256) {
+        return srtStake[user];
+    }
 
-    function usdcFreeOf(address user) external view returns (uint256) { return usdcStake[user]; }
-    function usdcLockedOf(address user) external view returns (uint256) { return usdcLocked[user]; }
-    function usdcTotalOf(address user) external view returns (uint256) { return usdcStake[user] + usdcLocked[user]; }
+    function srtLockedOf(address user) external view returns (uint256) {
+        return srtLocked[user];
+    }
+
+    function srtTotalOf(address user) external view returns (uint256) {
+        return srtStake[user] + srtLocked[user];
+    }
+
+    function usdcFreeOf(address user) external view returns (uint256) {
+        return usdcStake[user];
+    }
+
+    function usdcLockedOf(address user) external view returns (uint256) {
+        return usdcLocked[user];
+    }
+
+    function usdcTotalOf(address user) external view returns (uint256) {
+        return usdcStake[user] + usdcLocked[user];
+    }
 }
