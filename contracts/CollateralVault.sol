@@ -10,7 +10,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     IERC20 public immutable USDC;
 
     address public settlementContract;
-
     mapping(address => uint256) public srtStake;
     mapping(address => uint256) public srtLocked;
     mapping(address => uint256) public usdcStake;
@@ -19,7 +18,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
 
     // --- Events ---
     event SettlementContractSet(address indexed contractAddress);
-
     event DepositedSRT(address indexed user, uint256 amount);
     event WithdrawnSRT(address indexed user, uint256 amount);
     event LockedSRT(address indexed user, uint256 amount);
@@ -29,7 +27,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         address indexed recipient,
         uint256 amount
     );
-
     event DepositedUSDC(address indexed user, uint256 amount);
     event WithdrawnUSDC(address indexed user, uint256 amount);
     event LockedUSDC(address indexed user, uint256 amount);
@@ -63,7 +60,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     // --- SRT functions ---
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
-        // Set timestamp if first stake
         if (srtStake[msg.sender] == 0) {
             srtStakeTimestamp[msg.sender] = block.timestamp;
         }
@@ -171,6 +167,19 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         usdcLocked[user] -= amount;
         require(USDC.transfer(recipient, amount), "slash transfer failed");
         emit SlashedUSDC(user, recipient, amount);
+    }
+    
+    // --- New functions for PoIClaimProcessor ---
+    function reimburseSlashedSRT(address user, uint256 amount) external onlySettlement {
+        srtStake[user] += amount;
+        require(SRT.transfer(user, amount), "reimbursement failed");
+        emit ReleasedSRT(user, amount);
+    }
+
+    function reimburseSlashedUSDC(address user, uint256 amount) external onlySettlement {
+        usdcStake[user] += amount;
+        require(USDC.transfer(user, amount), "reimbursement failed");
+        emit ReleasedUSDC(user, amount);
     }
 
     // --- Views ---

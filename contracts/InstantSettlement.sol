@@ -3,29 +3,18 @@ pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 import "./CollateralVault.sol";
 
 interface ICollateralVault {
     function usdcFreeOf(address user) external view returns (uint256);
-
     function lockUSDC(address user, uint256 amount) external;
-
     function releaseUSDC(address user, uint256 amount) external;
-
-    function slashUSDC(
-        address user,
-        uint256 amount,
-        address recipient
-    ) external;
-
+    function slashUSDC(address user, uint256 amount, address recipient) external;
     function srtFreeOf(address user) external view returns (uint256);
-
     function lockSRT(address user, uint256 amount) external;
-
     function releaseSRT(address user, uint256 amount) external;
-
     function slashSRT(address user, uint256 amount, address recipient) external;
-
     function srtStakeTimestamp(address user) external view returns (uint256);
 }
 
@@ -33,10 +22,8 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
     ICollateralVault public vault;
     IERC20 public usdc;
     IERC20 public srt;
-
     mapping(address => bool) public isMerchant;
     mapping(address => bool) public merchantInstantOnly;
-
     uint256 public softCap;
     uint256 public usdcCollateralPercent = 110;
     uint256 public initialSrtPercent = 150;
@@ -83,7 +70,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
     // -----------------------------
     // Admin configuration
     // -----------------------------
-
     function setSoftCap(uint256 _softCap) external onlyOwner {
         softCap = _softCap;
         emit SoftCapUpdated(_softCap);
@@ -134,13 +120,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
     // -----------------------------
     // Core: Instant payment (USDC payments)
     // -----------------------------
-    //
-    // payer calls this to make an *instant* payment in USDC to `merchant`.
-    // `collateralIsSRT` indicates whether the payer wants to back the payment
-    // with SRT stake (true) or USDC stake (false).
-    //
-    // Pre-req: payer must have approved this contract (or the underlying transferFrom will be used).
-    //
     function sendInstantPayment(
         address merchant,
         uint256 amountUSDC,
@@ -160,8 +139,7 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         // --- Collateral and payment logic ---
         if (!collateralIsSRT) {
             // USDC collateral path
-            uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) /
-                100; // round up
+            uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) / 100;
             uint256 freeUSDC = vault.usdcFreeOf(msg.sender);
             require(freeUSDC >= requiredUSDC, "insufficient USDC collateral");
 
@@ -170,6 +148,7 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
 
             // Attempt transfer of USDC payment
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
+
             if (ok) {
                 // Success: release collateral
                 vault.releaseUSDC(msg.sender, requiredUSDC);
@@ -203,12 +182,9 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
             }
 
             // Compute required SRT units
-            // amountUSDC: 6 decimals
-            // srtPrice: 8 decimals
-            // Formula: requiredSRT = ceil(amountUSDC * percent * 1e20 / (100 * srtPrice))
             uint256 numerator = amountUSDC * percent * 1e20;
             uint256 denominator = 100 * srtPrice;
-            uint256 requiredSRT = (numerator + denominator - 1) / denominator; // round up
+            uint256 requiredSRT = (numerator + denominator - 1) / denominator;
 
             // Check payer has enough free SRT
             uint256 freeSRT = vault.srtFreeOf(msg.sender);
@@ -219,6 +195,7 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
 
             // Attempt USDC payment transfer
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
+
             if (ok) {
                 vault.releaseSRT(msg.sender, requiredSRT);
                 emit InstantPayment(
@@ -251,7 +228,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         return merchantInstantOnly[merchant];
     }
 
-    // Estimate required SRT units for an amountUSDC using current srtPrice and percent choice
     function estimateRequiredSRT(
         uint256 amountUSDC,
         bool useMaturePercent
