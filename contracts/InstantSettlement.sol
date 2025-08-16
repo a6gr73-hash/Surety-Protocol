@@ -8,13 +8,25 @@ import "./CollateralVault.sol";
 
 interface ICollateralVault {
     function usdcFreeOf(address user) external view returns (uint256);
+
     function lockUSDC(address user, uint256 amount) external;
+
     function releaseUSDC(address user, uint256 amount) external;
-    function slashUSDC(address user, uint256 amount, address recipient) external;
+
+    function slashUSDC(
+        address user,
+        uint256 amount,
+        address recipient
+    ) external;
+
     function srtFreeOf(address user) external view returns (uint256);
+
     function lockSRT(address user, uint256 amount) external;
+
     function releaseSRT(address user, uint256 amount) external;
+
     function slashSRT(address user, uint256 amount, address recipient) external;
+
     function srtStakeTimestamp(address user) external view returns (uint256);
 }
 
@@ -139,7 +151,8 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         // --- Collateral and payment logic ---
         if (!collateralIsSRT) {
             // USDC collateral path
-            uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) / 100;
+            uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) /
+                100;
             uint256 freeUSDC = vault.usdcFreeOf(msg.sender);
             require(freeUSDC >= requiredUSDC, "insufficient USDC collateral");
 

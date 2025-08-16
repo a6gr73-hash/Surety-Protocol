@@ -81,7 +81,6 @@ contract PoIClaimProcessor is Ownable {
         require(isShardRootPublished[claim.sourceShardRoot], "Source shard root not published");
         require(isShardRootPublished[claim.targetShardRoot], "Target shard root not published");
 
-        // The key for a transaction is its hash
         bytes memory slashedTxHash = abi.encodePacked(keccak256(claim.slashedProof[0]));
         bytes memory nonArrivalTxHash = abi.encodePacked(keccak256(claim.nonArrivalProof[0]));
 

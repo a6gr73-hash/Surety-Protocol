@@ -168,15 +168,21 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         require(USDC.transfer(recipient, amount), "slash transfer failed");
         emit SlashedUSDC(user, recipient, amount);
     }
-    
+
     // --- New functions for PoIClaimProcessor ---
-    function reimburseSlashedSRT(address user, uint256 amount) external onlySettlement {
+    function reimburseSlashedSRT(
+        address user,
+        uint256 amount
+    ) external onlySettlement {
         srtStake[user] += amount;
         require(SRT.transfer(user, amount), "reimbursement failed");
         emit ReleasedSRT(user, amount);
     }
 
-    function reimburseSlashedUSDC(address user, uint256 amount) external onlySettlement {
+    function reimburseSlashedUSDC(
+        address user,
+        uint256 amount
+    ) external onlySettlement {
         usdcStake[user] += amount;
         require(USDC.transfer(user, amount), "reimbursement failed");
         emit ReleasedUSDC(user, amount);
