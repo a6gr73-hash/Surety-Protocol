@@ -1,211 +1,120 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
-import "@openzeppelin/contracts/utils/math/SafeMath.sol";
-
-/**
- * @title RLPReader
- * @dev A library for decoding RLP-encoded data.
- */
 library RLPReader {
-    using SafeMath for uint256;
-    using SafeMath for uint8;
-    using RLPReader for RLPItem;
-    using RLPReader for bytes; // Added this line
-
-    // --- Constants for RLP decoding ---
-    uint8 constant STRING_SHORT_START = 0x80;
-    uint8 constant STRING_LONG_START = 0xb8;
-    uint8 constant LIST_SHORT_START = 0xc0;
-    uint8 constant LIST_LONG_START = 0xf8;
-
-    /**
-     * @dev Represents a single RLP-encoded item.
-     */
     struct RLPItem {
-        uint256 memPtr;
         uint256 len;
-    }
-
-    function toRlpItem(
-        bytes memory rlpData
-    ) internal pure returns (RLPItem memory) {
-        if (rlpData.length == 0) {
-            revert("RLPReader: Empty data");
-        }
-
-        uint8 byte0;
         uint256 memPtr;
-        uint256 len;
-
-        assembly {
-            memPtr := add(rlpData, 32)
-            byte0 := byte(0, mload(memPtr))
-        }
-
-        if (byte0 < STRING_SHORT_START) {
-            revert("RLPReader: Not a list");
-        } else if (byte0 < STRING_LONG_START) {
-            revert("RLPReader: Not a list");
-        } else if (byte0 < LIST_SHORT_START) {
-            revert("RLPReader: Not a list");
-        } else if (byte0 < LIST_LONG_START) {
-            len = byte0.sub(LIST_SHORT_START);
-            memPtr = memPtr.add(1);
-        } else {
-            uint256 lenOfLen = byte0.sub(LIST_LONG_START);
-            uint256 listLen;
-            uint256 rlpDataPtr;
-
-            assembly {
-                rlpDataPtr := add(memPtr, 1)
-            }
-
-            for (uint256 i = 0; i < lenOfLen; i++) {
-                uint8 currentByte;
-                assembly {
-                    currentByte := byte(i, mload(rlpDataPtr))
-                    listLen := shl(8, listLen)
-                    listLen := or(listLen, currentByte)
-                }
-            }
-            len = listLen;
-            assembly {
-                memPtr := add(rlpDataPtr, lenOfLen)
-            }
-        }
-
-        return RLPItem(memPtr, len);
     }
 
     function toBytes(RLPItem memory item) internal pure returns (bytes memory) {
-        bytes memory result = new bytes(item.len);
-        if (item.len == 0) {
-            return result;
-        }
-
-        uint256 destPtr;
-        uint256 srcPtr = item.memPtr;
-
+        bytes memory b = new bytes(item.len);
+        uint256 b_ptr;
         assembly {
-            destPtr := add(result, 32)
-            let bytesLength := mload(item)
-            for {
-                let i := 0
-            } lt(i, bytesLength) {
-                i := add(i, 32)
-            } {
-                mstore(destPtr, mload(srcPtr))
-                destPtr := add(destPtr, 32)
-                srcPtr := add(srcPtr, 32)
-            }
+            b_ptr := add(b, 0x20)
         }
-
-        return result;
+        _copy(item.memPtr, b_ptr, item.len);
+        return b;
     }
 
-    /**
-     * @notice Decodes an RLP-encoded list into an array of RLPItems.
-     * @dev This is a crucial helper for traversing MPT branch nodes.
-     * @param rlpList The RLPItem representing the list.
-     * @return An array of RLPItem structs for each element in the list.
-     */
-    function toList(
-        RLPItem memory rlpList
-    ) internal pure returns (RLPItem[] memory) {
-        uint256 listLen = rlpList.len;
-        uint256 memPtr = rlpList.memPtr;
-        uint256 itemCount;
-
-        uint256 currentItemStart = 0;
-        uint256 totalLength = 0;
-        bytes memory rlpData = rlpList.toBytes();
-
-        while (totalLength < listLen) {
-            uint256 start;
-            uint256 len;
-            (start, len) = rlpData._findNextItem(currentItemStart);
-            if (len == 0) {
-                break;
+    function toList(RLPItem memory item) internal pure returns (RLPItem[] memory) {
+        (uint256 payload_mem_ptr, uint256 payload_len) = _payload(item);
+        
+        RLPItem[] memory result = new RLPItem[](20);
+        uint256 items = 0;
+        uint256 curr_ptr = payload_mem_ptr;
+        while (curr_ptr < payload_mem_ptr + payload_len) {
+            uint256 item_len = _itemLength(curr_ptr);
+            if (items == result.length) {
+                // Resize array
+                RLPItem[] memory newResult = new RLPItem[](items * 2);
+                for(uint i=0; i < items; i++){
+                    newResult[i] = result[i];
+                }
+                result = newResult;
             }
-            totalLength = totalLength.add(len);
-            currentItemStart = start.add(len);
-            itemCount++;
+            result[items] = RLPItem(item_len, curr_ptr);
+            items++;
+            curr_ptr += item_len;
         }
-
-        RLPItem[] memory result = new RLPItem[](itemCount);
-        currentItemStart = 0;
-
-        for (uint256 i = 0; i < itemCount; i++) {
-            uint256 start;
-            uint256 len;
-            (start, len) = rlpData._findNextItem(currentItemStart);
-            if (len == 0) {
-                revert("Invalid RLP list format.");
-            }
-
-            result[i] = RLPItem(memPtr.add(start), len);
-            currentItemStart = start.add(len);
+        
+        RLPItem[] memory trimmed_result = new RLPItem[](items);
+        for (uint256 i = 0; i < items; i++) {
+            trimmed_result[i] = result[i];
         }
-
-        return result;
+        return trimmed_result;
+    }
+    
+    function toRlpItem(bytes memory self) internal pure returns (RLPItem memory) {
+        uint256 memPtr;
+        assembly {
+            memPtr := add(self, 0x20)
+        }
+        return RLPItem(self.length, memPtr);
     }
 
-    /**
-     * @dev Finds the start and length of the next RLP item in a byte array.
-     * @param _bytes The RLP-encoded data.
-     * @param _index The starting index to search from.
-     * @return start The starting index of the next RLP item.
-     * @return len The length of the next RLP item.
-     */
-    function _findNextItem(
-        bytes memory _bytes,
-        uint256 _index
-    ) internal pure returns (uint256 start, uint256 len) {
-        if (_index >= _bytes.length) {
-            return (0, 0);
+    function _payload(RLPItem memory item) private pure returns (uint256, uint256) {
+        uint256 ptr = item.memPtr;
+        uint256 len = item.len;
+        uint8 first_byte;
+        assembly {
+            first_byte := byte(0, mload(ptr))
         }
 
-        uint8 firstByte = uint8(_bytes[_index]);
-        if (firstByte <= 0x7f) {
-            start = _index;
-            len = 1;
-        } else if (firstByte <= 0xb7) {
-            start = _index;
-            len = firstByte.sub(0x80).add(1);
-        } else if (firstByte <= 0xbf) {
-            uint256 lenOfLen = firstByte.sub(0xb7);
-            start = _index.add(1);
-            len = _bytesToUint(_bytes, start, lenOfLen);
-            start = start.add(lenOfLen);
-        } else if (firstByte <= 0xf7) {
-            start = _index;
-            len = firstByte.sub(0xc0).add(1);
+        if (first_byte < 0x80) {
+            revert("RLPReader: invalid single-byte");
+        } else if (first_byte < 0xB8) {
+            return (ptr + 1, len - 1);
+        } else if (first_byte < 0xC0) {
+            uint8 len_len = first_byte - 0xB7;
+            return (ptr + 1 + len_len, len - 1 - len_len);
+        } else if (first_byte < 0xF8) {
+            return (ptr + 1, len - 1);
         } else {
-            uint256 lenOfLen = firstByte.sub(0xf7);
-            start = _index.add(1);
-            len = _bytesToUint(_bytes, start, lenOfLen);
-            start = start.add(lenOfLen);
+            uint8 len_len = first_byte - 0xF7;
+            return (ptr + 1 + len_len, len - 1 - len_len);
         }
-        return (start, len);
     }
 
-    /**
-     * @dev Converts a byte array to a uint256.
-     * @param _bytes The byte array to convert.
-     * @param _start The starting index.
-     * @param _len The length of the byte array to convert.
-     * @return The resulting uint256.
-     */
-    function _bytesToUint(
-        bytes memory _bytes,
-        uint256 _start,
-        uint256 _len
-    ) internal pure returns (uint256) {
-        uint256 number;
-        for (uint256 i = 0; i < _len; i++) {
-            number = number.mul(256).add(uint8(_bytes[_start.add(i)]));
+    function _itemLength(uint256 mem_ptr) private pure returns (uint256) {
+        uint8 first_byte;
+        assembly {
+            first_byte := byte(0, mload(mem_ptr))
         }
-        return number;
+        if (first_byte < 0x80) {
+            return 1;
+        } else if (first_byte < 0xB8) {
+            return uint256(first_byte) - 0x80 + 1;
+        } else if (first_byte < 0xC0) {
+            uint8 len_len = first_byte - 0xB7;
+            uint256 len = _toUint(mem_ptr + 1, len_len);
+            return len + uint256(len_len) + 1;
+        } else if (first_byte < 0xF8) {
+            return uint256(first_byte) - 0xC0 + 1;
+        } else {
+            uint8 len_len = first_byte - 0xF7;
+            uint256 len = _toUint(mem_ptr + 1, len_len);
+            return len + uint256(len_len) + 1;
+        }
+    }
+    
+    function _toUint(uint256 memPtr, uint256 len) private pure returns (uint256) {
+        uint256 result = 0;
+        for (uint256 i = 0; i < len; i++) {
+            uint8 b;
+            uint256 p = memPtr + i;
+            assembly { b := byte(0, mload(p)) }
+            result = (result << 8) | b;
+        }
+        return result;
+    }
+
+    function _copy(uint256 src, uint256 dest, uint256 len) private pure {
+        for (uint256 i = 0; i < len; i += 32) {
+            assembly {
+                mstore(add(dest, i), mload(add(src, i)))
+            }
+        }
     }
 }
+

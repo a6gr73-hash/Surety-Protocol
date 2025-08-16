@@ -18,6 +18,7 @@
     "typechain": "^8.3.2"
   },
   "dependencies": {
+    "@ethereumjs/trie": "^6.2.1",
     "@openzeppelin/contracts": "^4.9.6"
   }
 }

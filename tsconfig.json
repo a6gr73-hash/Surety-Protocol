@@ -8,12 +8,6 @@
     "skipLibCheck": true,
     "resolveJsonModule": true
   },
-  "include": [
-    "./scripts",
-    "./test",
-    "./typechain-types",
-    "./artifacts",
-    "./node_modules/@openzeppelin"
-  ],
+  "include": ["./scripts", "./test", "./typechain-types"],
   "files": ["./hardhat.config.ts"]
 }

@@ -70,12 +70,10 @@ describe("Surety Token", function () {
 
         // addr1 attempts to mint
         await expect(suretyToken.connect(addr1).mint(addr1.address, amount))
-            .to.be.revertedWithCustomError(suretyToken, "OwnableUnauthorizedAccount")
-            .withArgs(addr1.address);
+            .to.be.revertedWith("Ownable: caller is not the owner");
 
         // addr1 attempts to burn
         await expect(suretyToken.connect(addr1).burn(owner.address, amount))
-            .to.be.revertedWithCustomError(suretyToken, "OwnableUnauthorizedAccount")
-            .withArgs(addr1.address);
+            .to.be.revertedWith("Ownable: caller is not the owner");
     });
 });

@@ -6,14 +6,11 @@ import "./libraries/MerklePatriciaTrie.sol";
 
 interface ICollateralVault {
     function reimburseSlashedSRT(address user, uint256 amount) external;
+
     function reimburseSlashedUSDC(address user, uint256 amount) external;
 }
 
 contract PoIClaimProcessor is Ownable {
-    using MerklePatriciaTrie for bytes;
-    using MerklePatriciaTrie for bytes[];
-    using RLPReader for RLPReader.RLPItem; // Adding this line for compilation
-
     address public collateralVault;
 
     struct PoIClaim {
@@ -47,25 +44,24 @@ contract PoIClaimProcessor is Ownable {
         collateralVault = _collateralVault;
     }
 
-    function submitPoIClaim(bytes calldata claim, bytes memory signature) external {
-        PoIClaim memory newClaim = abi.decode(claim, (PoIClaim));
+    function submitPoIClaim(
+        bytes calldata claimData,
+        bytes memory signature
+    ) external {
+        PoIClaim memory newClaim = abi.decode(claimData, (PoIClaim));
         require(newClaim.nonce == nextNonce[newClaim.payer], "Invalid nonce");
 
-        bytes32 claimHash = keccak256(claim);
-        bytes32 messageHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash));
-        bytes32 r; bytes32 s; uint8 v;
+        bytes32 claimHash = keccak256(claimData);
+        bytes32 messageHash = keccak256(
+            abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash)
+        );
 
-        assembly {
-            r := mload(add(signature, 32))
-            s := mload(add(signature, 64))
-            v := byte(0, mload(add(signature, 96)))
-        }
-
-        if (v < 27) { v += 27; }
-        address signer = ecrecover(messageHash, v, r, s);
-
+        address signer = recoverSigner(messageHash, signature);
         require(signer == newClaim.payer, "Invalid signature or payer address");
-        require(claims[claimHash].payer == address(0), "Claim already submitted");
+        require(
+            claims[claimHash].payer == address(0),
+            "Claim already submitted"
+        );
 
         newClaim.relayer = msg.sender;
         claims[claimHash] = newClaim;
@@ -73,21 +69,41 @@ contract PoIClaimProcessor is Ownable {
 
         emit PoIClaimSubmitted(newClaim.payer, claimHash);
     }
-    
+
     function verifyPoIClaim(bytes32 claimId) external onlyOwner {
         PoIClaim storage claim = claims[claimId];
         require(claim.payer != address(0), "Claim does not exist");
         require(!claim.isVerified, "Claim already verified");
-        
-        require(isShardRootPublished[claim.sourceShardRoot], "Source shard root not published");
-        require(isShardRootPublished[claim.targetShardRoot], "Target shard root not published");
 
-        bytes memory slashedTxHash = abi.encodePacked(keccak256(claim.slashedProof[0]));
-        bytes memory nonArrivalTxHash = abi.encodePacked(keccak256(claim.nonArrivalProof[0]));
+        require(
+            isShardRootPublished[claim.sourceShardRoot],
+            "Source shard root not published"
+        );
+        require(
+            isShardRootPublished[claim.targetShardRoot],
+            "Target shard root not published"
+        );
 
-        bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(claim.slashedProof, claim.sourceShardRoot, slashedTxHash, claim.slashedProof[0]);
-        bool isProofOfNonArrivalValid = MerklePatriciaTrie.verifyNonInclusion(claim.nonArrivalProof, claim.targetShardRoot, nonArrivalTxHash);
-        
+        // The key for the proof is the hash of the transaction data itself.
+        bytes32 slashedTxHash = keccak256(claim.slashedProof[0]);
+
+        // --- THIS IS THE CORRECTED LOGIC ---
+        // Explicitly convert the bytes32 key to bytes memory
+        bytes memory txHashAsBytes = abi.encodePacked(slashedTxHash);
+
+        bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(
+            claim.slashedProof,
+            claim.sourceShardRoot,
+            txHashAsBytes,
+            claim.slashedProof[0]
+        );
+        bytes memory nonArrivalValue = MerklePatriciaTrie.get(
+            claim.nonArrivalProof,
+            claim.targetShardRoot,
+            txHashAsBytes
+        );
+        bool isProofOfNonArrivalValid = nonArrivalValue.length == 0;
+
         if (isProofOfDepartureValid && isProofOfNonArrivalValid) {
             claim.isVerified = true;
             emit PoIClaimVerified(claimId, claim.slashedAmount);
@@ -106,24 +122,37 @@ contract PoIClaimProcessor is Ownable {
         require(!claim.isReimbursed, "Claim already reimbursed");
 
         if (claim.collateralToken == address(0)) {
-            ICollateralVault(collateralVault).reimburseSlashedSRT(claim.payer, claim.slashedAmount);
+            // Assuming SRT is address(0) sentinel
+            ICollateralVault(collateralVault).reimburseSlashedSRT(
+                claim.payer,
+                claim.slashedAmount
+            );
         } else {
-            ICollateralVault(collateralVault).reimburseSlashedUSDC(claim.payer, claim.slashedAmount);
+            ICollateralVault(collateralVault).reimburseSlashedUSDC(
+                claim.payer,
+                claim.slashedAmount
+            );
         }
-        
+
         claim.isReimbursed = true;
         emit PoIClaimReimbursed(claimId, claim.slashedAmount);
     }
 
-    function relayerGasReimbursement(address relayer, uint256 amount) external onlyOwner {
-        require(relayer != address(0), "Relayer address cannot be zero.");
-        require(address(this).balance >= amount, "Insufficient contract balance for reimbursement.");
-        
-        (bool success, ) = relayer.call{value: amount}("");
-        require(success, "Reimbursement failed.");
-
-        emit RelayerReimbursed(relayer, amount);
+    function recoverSigner(
+        bytes32 _messageHash,
+        bytes memory _signature
+    ) internal pure returns (address) {
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+        assembly {
+            r := mload(add(_signature, 32))
+            s := mload(add(_signature, 64))
+            v := byte(0, mload(add(_signature, 96)))
+        }
+        if (v < 27) {
+            v += 27;
+        }
+        return ecrecover(_messageHash, v, r, s);
     }
-
-    receive() external payable {}
 }
