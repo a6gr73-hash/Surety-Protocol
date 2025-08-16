@@ -105,6 +105,53 @@ library RLPReader {
     }
 
     /**
+     * @notice Decodes an RLP-encoded list into an array of RLPItems.
+     * @dev This is a crucial helper for traversing MPT branch nodes.
+     * @param rlpList The RLPItem representing the list.
+     * @return An array of RLPItem structs for each element in the list.
+     */
+    function toList(
+        RLPItem memory rlpList
+    ) internal pure returns (RLPItem[] memory) {
+        uint256 listLen = rlpList.len;
+        uint256 memPtr = rlpList.memPtr;
+        uint256 itemCount;
+
+        uint256 currentItemStart = 0;
+        uint256 totalLength = 0;
+        bytes memory rlpData = rlpList.toBytes();
+
+        while (totalLength < listLen) {
+            uint256 start;
+            uint256 len;
+            (start, len) = rlpData._findNextItem(currentItemStart);
+            if (len == 0) {
+                break;
+            }
+            totalLength = totalLength.add(len);
+            currentItemStart = start.add(len);
+            itemCount++;
+        }
+
+        RLPItem[] memory result = new RLPItem[](itemCount);
+        currentItemStart = 0;
+
+        for (uint256 i = 0; i < itemCount; i++) {
+            uint256 start;
+            uint256 len;
+            (start, len) = rlpData._findNextItem(currentItemStart);
+            if (len == 0) {
+                revert("Invalid RLP list format.");
+            }
+
+            result[i] = RLPItem(memPtr.add(start), len);
+            currentItemStart = start.add(len);
+        }
+
+        return result;
+    }
+
+    /**
      * @dev Finds the start and length of the next RLP item in a byte array.
      * @param _bytes The RLP-encoded data.
      * @param _index The starting index to search from.
@@ -160,50 +207,5 @@ library RLPReader {
             number = number.mul(256).add(uint8(_bytes[_start.add(i)]));
         }
         return number;
-    }
-
-    /**
-     * @notice Decodes an RLP-encoded list into an array of RLPItems.
-     * @dev This is a crucial helper for traversing MPT branch nodes.
-     * @param rlpList The RLPItem representing the list.
-     * @return An array of RLPItem structs for each element in the list.
-     */
-    function toList(RLPItem memory rlpList) internal pure returns (RLPItem[] memory) {
-        uint256 listLen = rlpList.len;
-        uint256 memPtr = rlpList.memPtr;
-        uint256 itemCount;
-        
-        uint256 currentItemStart = 0;
-        uint256 totalLength = 0;
-        bytes memory rlpData = rlpList.toBytes();
-
-        while (totalLength < listLen) {
-            uint256 start;
-            uint256 len;
-            (start, len) = rlpData._findNextItem(currentItemStart);
-            if (len == 0) {
-                break;
-            }
-            totalLength = totalLength.add(len);
-            currentItemStart = start.add(len);
-            itemCount++;
-        }
-        
-        RLPItem[] memory result = new RLPItem[](itemCount);
-        currentItemStart = 0;
-        
-        for (uint256 i = 0; i < itemCount; i++) {
-            uint256 start;
-            uint256 len;
-            (start, len) = rlpData._findNextItem(currentItemStart);
-            if (len == 0) {
-                revert("Invalid RLP list format.");
-            }
-            
-            result[i] = RLPItem(memPtr.add(start), len);
-            currentItemStart = start.add(len);
-        }
-        
-        return result;
     }
 }

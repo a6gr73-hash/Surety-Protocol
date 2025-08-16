@@ -12,6 +12,7 @@ interface ICollateralVault {
 contract PoIClaimProcessor is Ownable {
     using MerklePatriciaTrie for bytes;
     using MerklePatriciaTrie for bytes[];
+    using RLPReader for RLPReader.RLPItem; // Adding this line for compilation
 
     address public collateralVault;
 
