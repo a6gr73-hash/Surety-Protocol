@@ -1,3 +1,5 @@
+// contracts/CollateralVault.sol
+
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -10,6 +12,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     IERC20 public immutable USDC;
 
     address public settlementContract;
+
     mapping(address => uint256) public srtStake;
     mapping(address => uint256) public srtLocked;
     mapping(address => uint256) public usdcStake;
@@ -42,7 +45,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         _;
     }
 
-    // --- Constructor ---
     constructor(address _srt, address _usdc) {
         require(_srt != address(0), "SRT=0");
         require(_usdc != address(0), "USDC=0");
@@ -50,20 +52,17 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         USDC = IERC20(_usdc);
     }
 
-    // --- Admin: set settlement contract ---
     function setSettlementContract(address _settlement) external onlyOwner {
         require(_settlement != address(0), "settlement=0");
         settlementContract = _settlement;
         emit SettlementContractSet(_settlement);
     }
 
-    // --- SRT functions ---
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         if (srtStake[msg.sender] == 0) {
             srtStakeTimestamp[msg.sender] = block.timestamp;
         }
-
         srtStake[msg.sender] += amount;
         require(
             SRT.transferFrom(msg.sender, address(this), amount),
@@ -115,7 +114,6 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit SlashedSRT(user, recipient, amount);
     }
 
-    // --- USDC functions ---
     function depositUSDC(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         usdcStake[msg.sender] += amount;
@@ -169,14 +167,14 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit SlashedUSDC(user, recipient, amount);
     }
 
-    // --- New functions for PoIClaimProcessor ---
     function reimburseSlashedSRT(
         address user,
         uint256 amount
     ) external onlySettlement {
         srtStake[user] += amount;
-        require(SRT.transfer(user, amount), "reimbursement failed");
+        // ⭐ FIX: Emit event before external call
         emit ReleasedSRT(user, amount);
+        require(SRT.transfer(user, amount), "reimbursement failed");
     }
 
     function reimburseSlashedUSDC(
@@ -184,8 +182,9 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         uint256 amount
     ) external onlySettlement {
         usdcStake[user] += amount;
-        require(USDC.transfer(user, amount), "reimbursement failed");
+        // ⭐ FIX: Emit event before external call
         emit ReleasedUSDC(user, amount);
+        require(USDC.transfer(user, amount), "reimbursement failed");
     }
 
     // --- Views ---

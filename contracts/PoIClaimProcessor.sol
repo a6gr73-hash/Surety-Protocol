@@ -1,3 +1,5 @@
+// contracts/PoIClaimProcessor.sol
+
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -6,12 +8,12 @@ import "./libraries/MerklePatriciaTrie.sol";
 
 interface ICollateralVault {
     function reimburseSlashedSRT(address user, uint256 amount) external;
-
     function reimburseSlashedUSDC(address user, uint256 amount) external;
 }
 
 contract PoIClaimProcessor is Ownable {
-    address public collateralVault;
+    // ⭐ FIX: Made immutable for security and gas savings
+    address public immutable collateralVault;
 
     struct PoIClaim {
         address payer;
@@ -55,14 +57,12 @@ contract PoIClaimProcessor is Ownable {
         bytes32 messageHash = keccak256(
             abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash)
         );
-
         address signer = recoverSigner(messageHash, signature);
         require(signer == newClaim.payer, "Invalid signature or payer address");
         require(
             claims[claimHash].payer == address(0),
             "Claim already submitted"
         );
-
         newClaim.relayer = msg.sender;
         claims[claimHash] = newClaim;
         nextNonce[newClaim.payer]++;
@@ -74,7 +74,6 @@ contract PoIClaimProcessor is Ownable {
         PoIClaim storage claim = claims[claimId];
         require(claim.payer != address(0), "Claim does not exist");
         require(!claim.isVerified, "Claim already verified");
-
         require(
             isShardRootPublished[claim.sourceShardRoot],
             "Source shard root not published"
@@ -83,12 +82,7 @@ contract PoIClaimProcessor is Ownable {
             isShardRootPublished[claim.targetShardRoot],
             "Target shard root not published"
         );
-
-        // The key for the proof is the hash of the transaction data itself.
         bytes32 slashedTxHash = keccak256(claim.slashedProof[0]);
-
-        // --- THIS IS THE CORRECTED LOGIC ---
-        // Explicitly convert the bytes32 key to bytes memory
         bytes memory txHashAsBytes = abi.encodePacked(slashedTxHash);
 
         bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(
@@ -121,6 +115,10 @@ contract PoIClaimProcessor is Ownable {
         require(claim.isVerified, "Claim not verified");
         require(!claim.isReimbursed, "Claim already reimbursed");
 
+        // ⭐ FIX: State change moved before external call (Checks-Effects-Interactions)
+        claim.isReimbursed = true;
+        emit PoIClaimReimbursed(claimId, claim.slashedAmount);
+
         if (claim.collateralToken == address(0)) {
             // Assuming SRT is address(0) sentinel
             ICollateralVault(collateralVault).reimburseSlashedSRT(
@@ -133,9 +131,6 @@ contract PoIClaimProcessor is Ownable {
                 claim.slashedAmount
             );
         }
-
-        claim.isReimbursed = true;
-        emit PoIClaimReimbursed(claimId, claim.slashedAmount);
     }
 
     function recoverSigner(

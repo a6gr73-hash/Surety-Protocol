@@ -1,3 +1,5 @@
+// contracts/InstantSettlement.sol
+
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -31,9 +33,11 @@ interface ICollateralVault {
 }
 
 contract InstantSettlement is Ownable, ReentrancyGuard {
-    ICollateralVault public vault;
-    IERC20 public usdc;
-    IERC20 public srt;
+    // ⭐ FIX: Made immutable for security and gas savings
+    ICollateralVault public immutable vault;
+    IERC20 public immutable usdc;
+    IERC20 public immutable srt;
+
     mapping(address => bool) public isMerchant;
     mapping(address => bool) public merchantInstantOnly;
     uint256 public softCap;
@@ -47,6 +51,14 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
     event MerchantUpdated(address indexed merchant, bool instantOnly);
     event SoftCapUpdated(uint256 newSoftCap);
     event SrtPriceUpdated(uint256 newPrice);
+    // ⭐ FIX: Added missing events
+    event SrtParamsUpdated(
+        uint256 initialPercent,
+        uint256 maturePercent,
+        uint256 maturitySeconds
+    );
+    event UsdcCollateralPercentUpdated(uint256 percent);
+
     event InstantPayment(
         address indexed payer,
         address indexed merchant,
@@ -79,16 +91,12 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         softCap = _softCap;
     }
 
-    // -----------------------------
-    // Admin configuration
-    // -----------------------------
     function setSoftCap(uint256 _softCap) external onlyOwner {
         softCap = _softCap;
         emit SoftCapUpdated(_softCap);
     }
 
     function setSrtPrice(uint256 _srtPrice) external onlyOwner {
-        // srtPrice is USD per SRT with 8 decimals (like many oracle feeds)
         srtPrice = _srtPrice;
         emit SrtPriceUpdated(_srtPrice);
     }
@@ -102,14 +110,21 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         initialSrtPercent = _initialPercent;
         matureSrtPercent = _maturePercent;
         srtMaturity = _maturitySeconds;
+        // ⭐ FIX: Emitting event
+        emit SrtParamsUpdated(
+            _initialPercent,
+            _maturePercent,
+            _maturitySeconds
+        );
     }
 
     function setUsdcCollateralPercent(uint256 _percent) external onlyOwner {
         require(_percent >= 100, "percent<100");
         usdcCollateralPercent = _percent;
+        // ⭐ FIX: Emitting event
+        emit UsdcCollateralPercentUpdated(_percent);
     }
 
-    // Merchant management
     function registerMerchant(
         address merchant,
         bool instantOnly
@@ -129,41 +144,26 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         emit MerchantUpdated(merchant, instantOnly);
     }
 
-    // -----------------------------
-    // Core: Instant payment (USDC payments)
-    // -----------------------------
     function sendInstantPayment(
         address merchant,
         uint256 amountUSDC,
         bool collateralIsSRT
     ) external nonReentrant {
-        // --- Basic checks ---
         require(isMerchant[merchant], "recipient not merchant");
         require(amountUSDC > 0, "amount=0");
         require(amountUSDC <= softCap, "above soft cap");
-
-        // --- Enforce merchant instant-only ---
         require(
             merchantInstantOnly[merchant],
             "merchant does not accept instant payments"
         );
-
-        // --- Collateral and payment logic ---
         if (!collateralIsSRT) {
-            // USDC collateral path
             uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) /
                 100;
             uint256 freeUSDC = vault.usdcFreeOf(msg.sender);
             require(freeUSDC >= requiredUSDC, "insufficient USDC collateral");
-
-            // Lock collateral
             vault.lockUSDC(msg.sender, requiredUSDC);
-
-            // Attempt transfer of USDC payment
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
-
             if (ok) {
-                // Success: release collateral
                 vault.releaseUSDC(msg.sender, requiredUSDC);
                 emit InstantPayment(
                     msg.sender,
@@ -173,7 +173,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
                     requiredUSDC
                 );
             } else {
-                // Failure: slash collateral
                 vault.slashUSDC(msg.sender, requiredUSDC, merchant);
                 emit InstantPaymentFailed(
                     msg.sender,
@@ -184,31 +183,21 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
                 );
             }
         } else {
-            // --- SRT collateral path ---
             require(srtPrice > 0, "srtPrice not set");
-
-            // Determine percent based on stake age
             uint256 stakeTs = vault.srtStakeTimestamp(msg.sender);
             uint256 percent = initialSrtPercent;
             if (stakeTs > 0 && block.timestamp >= stakeTs + srtMaturity) {
                 percent = matureSrtPercent;
             }
 
-            // Compute required SRT units
             uint256 numerator = amountUSDC * percent * 1e20;
             uint256 denominator = 100 * srtPrice;
             uint256 requiredSRT = (numerator + denominator - 1) / denominator;
-
-            // Check payer has enough free SRT
             uint256 freeSRT = vault.srtFreeOf(msg.sender);
             require(freeSRT >= requiredSRT, "insufficient SRT collateral");
 
-            // Lock SRT collateral
             vault.lockSRT(msg.sender, requiredSRT);
-
-            // Attempt USDC payment transfer
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
-
             if (ok) {
                 vault.releaseSRT(msg.sender, requiredSRT);
                 emit InstantPayment(
@@ -230,10 +219,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
             }
         }
     }
-
-    // -----------------------------
-    // Convenience / view helpers
-    // -----------------------------
 
     function merchantIsInstantOnly(
         address merchant
