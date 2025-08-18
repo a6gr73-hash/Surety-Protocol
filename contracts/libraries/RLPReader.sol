@@ -1,3 +1,5 @@
+// contracts/libraries/RLPReader.sol
+
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -7,6 +9,7 @@ library RLPReader {
         uint256 memPtr;
     }
 
+    /* --- Functions up to isList are unchanged --- */
     function toBytes(RLPItem memory item) internal pure returns (bytes memory) {
         bytes memory b = new bytes(item.len);
         uint256 b_ptr;
@@ -19,14 +22,12 @@ library RLPReader {
 
     function toList(RLPItem memory item) internal pure returns (RLPItem[] memory) {
         (uint256 payload_mem_ptr, uint256 payload_len) = _payload(item);
-        
         RLPItem[] memory result = new RLPItem[](20);
         uint256 items = 0;
         uint256 curr_ptr = payload_mem_ptr;
         while (curr_ptr < payload_mem_ptr + payload_len) {
             uint256 item_len = _itemLength(curr_ptr);
             if (items == result.length) {
-                // Resize array
                 RLPItem[] memory newResult = new RLPItem[](items * 2);
                 for(uint i=0; i < items; i++){
                     newResult[i] = result[i];
@@ -51,6 +52,23 @@ library RLPReader {
             memPtr := add(self, 0x20)
         }
         return RLPItem(self.length, memPtr);
+    }
+
+    // ⭐ CORRECTED FUNCTION ⭐
+    /**
+     * @dev Checks if an RLPItem is a list.
+     * @param item The RLPItem to check.
+     * @return bool True if the item is a list, false otherwise.
+     */
+    function isList(RLPItem memory item) internal pure returns (bool) {
+        if (item.len == 0) return false;
+        uint8 first_byte;
+        // Fix: Assign memPtr to a local variable before the assembly block.
+        uint256 ptr = item.memPtr;
+        assembly {
+            first_byte := byte(0, mload(ptr))
+        }
+        return first_byte >= 0xc0;
     }
 
     function _payload(RLPItem memory item) private pure returns (uint256, uint256) {
@@ -117,4 +135,3 @@ library RLPReader {
         }
     }
 }
-
