@@ -9,8 +9,18 @@ library RLPReader {
         uint256 memPtr;
     }
 
-    /* --- Functions up to isList are unchanged --- */
     function toBytes(RLPItem memory item) internal pure returns (bytes memory) {
+        (uint256 payloadPtr, uint256 payloadLen) = _payload(item);
+        bytes memory b = new bytes(payloadLen);
+        uint256 b_ptr;
+        assembly {
+            b_ptr := add(b, 0x20)
+        }
+        _copy(payloadPtr, b_ptr, payloadLen);
+        return b;
+    }
+
+    function toRlpBytes(RLPItem memory item) internal pure returns (bytes memory) {
         bytes memory b = new bytes(item.len);
         uint256 b_ptr;
         assembly {
@@ -54,16 +64,9 @@ library RLPReader {
         return RLPItem(self.length, memPtr);
     }
 
-    // ⭐ CORRECTED FUNCTION ⭐
-    /**
-     * @dev Checks if an RLPItem is a list.
-     * @param item The RLPItem to check.
-     * @return bool True if the item is a list, false otherwise.
-     */
     function isList(RLPItem memory item) internal pure returns (bool) {
         if (item.len == 0) return false;
         uint8 first_byte;
-        // Fix: Assign memPtr to a local variable before the assembly block.
         uint256 ptr = item.memPtr;
         assembly {
             first_byte := byte(0, mload(ptr))
@@ -79,17 +82,17 @@ library RLPReader {
             first_byte := byte(0, mload(ptr))
         }
 
-        if (first_byte < 0x80) {
-            revert("RLPReader: invalid single-byte");
-        } else if (first_byte < 0xB8) {
+        if (first_byte <= 0x7f) {
+            return (ptr, 1);
+        } else if (first_byte <= 0xb7) {
             return (ptr + 1, len - 1);
-        } else if (first_byte < 0xC0) {
-            uint8 len_len = first_byte - 0xB7;
+        } else if (first_byte <= 0xbf) {
+            uint8 len_len = first_byte - 0xb7;
             return (ptr + 1 + len_len, len - 1 - len_len);
-        } else if (first_byte < 0xF8) {
+        } else if (first_byte <= 0xf7) {
             return (ptr + 1, len - 1);
         } else {
-            uint8 len_len = first_byte - 0xF7;
+            uint8 len_len = first_byte - 0xf7;
             return (ptr + 1 + len_len, len - 1 - len_len);
         }
     }
@@ -99,18 +102,18 @@ library RLPReader {
         assembly {
             first_byte := byte(0, mload(mem_ptr))
         }
-        if (first_byte < 0x80) {
+        if (first_byte <= 0x7f) {
             return 1;
-        } else if (first_byte < 0xB8) {
+        } else if (first_byte <= 0xb7) {
             return uint256(first_byte) - 0x80 + 1;
-        } else if (first_byte < 0xC0) {
-            uint8 len_len = first_byte - 0xB7;
+        } else if (first_byte <= 0xbf) {
+            uint8 len_len = first_byte - 0xb7;
             uint256 len = _toUint(mem_ptr + 1, len_len);
             return len + uint256(len_len) + 1;
-        } else if (first_byte < 0xF8) {
-            return uint256(first_byte) - 0xC0 + 1;
+        } else if (first_byte <= 0xf7) {
+            return uint256(first_byte) - 0xc0 + 1;
         } else {
-            uint8 len_len = first_byte - 0xF7;
+            uint8 len_len = first_byte - 0xf7;
             uint256 len = _toUint(mem_ptr + 1, len_len);
             return len + uint256(len_len) + 1;
         }

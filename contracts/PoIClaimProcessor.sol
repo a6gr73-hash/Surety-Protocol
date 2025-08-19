@@ -1,5 +1,4 @@
 // contracts/PoIClaimProcessor.sol
-
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -12,7 +11,6 @@ interface ICollateralVault {
 }
 
 contract PoIClaimProcessor is Ownable {
-    // ⭐ FIX: Made immutable for security and gas savings
     address public immutable collateralVault;
 
     struct PoIClaim {
@@ -22,6 +20,7 @@ contract PoIClaimProcessor is Ownable {
         uint256 slashedAmount;
         uint256 timestamp;
         uint256 nonce;
+        bytes slashedTxData;
         bytes[] slashedProof;
         bytes[] nonArrivalProof;
         bytes32 sourceShardRoot;
@@ -46,10 +45,7 @@ contract PoIClaimProcessor is Ownable {
         collateralVault = _collateralVault;
     }
 
-    function submitPoIClaim(
-        bytes calldata claimData,
-        bytes memory signature
-    ) external {
+    function submitPoIClaim(bytes calldata claimData, bytes memory signature) external {
         PoIClaim memory newClaim = abi.decode(claimData, (PoIClaim));
         require(newClaim.nonce == nextNonce[newClaim.payer], "Invalid nonce");
 
@@ -59,10 +55,8 @@ contract PoIClaimProcessor is Ownable {
         );
         address signer = recoverSigner(messageHash, signature);
         require(signer == newClaim.payer, "Invalid signature or payer address");
-        require(
-            claims[claimHash].payer == address(0),
-            "Claim already submitted"
-        );
+        require(claims[claimHash].payer == address(0), "Claim already submitted");
+
         newClaim.relayer = msg.sender;
         claims[claimHash] = newClaim;
         nextNonce[newClaim.payer]++;
@@ -74,23 +68,20 @@ contract PoIClaimProcessor is Ownable {
         PoIClaim storage claim = claims[claimId];
         require(claim.payer != address(0), "Claim does not exist");
         require(!claim.isVerified, "Claim already verified");
-        require(
-            isShardRootPublished[claim.sourceShardRoot],
-            "Source shard root not published"
-        );
-        require(
-            isShardRootPublished[claim.targetShardRoot],
-            "Target shard root not published"
-        );
-        bytes32 slashedTxHash = keccak256(claim.slashedProof[0]);
+        require(isShardRootPublished[claim.sourceShardRoot], "Source shard root not published");
+        require(isShardRootPublished[claim.targetShardRoot], "Target shard root not published");
+
+        bytes32 slashedTxHash = keccak256(claim.slashedTxData);
         bytes memory txHashAsBytes = abi.encodePacked(slashedTxHash);
 
+        // ⭐ FIX: Added the missing 'claim.slashedTxData' argument
         bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(
             claim.slashedProof,
             claim.sourceShardRoot,
             txHashAsBytes,
-            claim.slashedProof[0]
+            claim.slashedTxData
         );
+
         bytes memory nonArrivalValue = MerklePatriciaTrie.get(
             claim.nonArrivalProof,
             claim.targetShardRoot,
@@ -115,12 +106,10 @@ contract PoIClaimProcessor is Ownable {
         require(claim.isVerified, "Claim not verified");
         require(!claim.isReimbursed, "Claim already reimbursed");
 
-        // ⭐ FIX: State change moved before external call (Checks-Effects-Interactions)
         claim.isReimbursed = true;
         emit PoIClaimReimbursed(claimId, claim.slashedAmount);
 
         if (claim.collateralToken == address(0)) {
-            // Assuming SRT is address(0) sentinel
             ICollateralVault(collateralVault).reimburseSlashedSRT(
                 claim.payer,
                 claim.slashedAmount
@@ -137,6 +126,7 @@ contract PoIClaimProcessor is Ownable {
         bytes32 _messageHash,
         bytes memory _signature
     ) internal pure returns (address) {
+        require(_signature.length == 65, "Invalid signature length");
         bytes32 r;
         bytes32 s;
         uint8 v;
