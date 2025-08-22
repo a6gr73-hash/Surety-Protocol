@@ -20,7 +20,9 @@ library RLPReader {
         return b;
     }
 
-    function toRlpBytes(RLPItem memory item) internal pure returns (bytes memory) {
+    function toRlpBytes(
+        RLPItem memory item
+    ) internal pure returns (bytes memory) {
         bytes memory b = new bytes(item.len);
         uint256 b_ptr;
         assembly {
@@ -30,7 +32,9 @@ library RLPReader {
         return b;
     }
 
-    function toList(RLPItem memory item) internal pure returns (RLPItem[] memory) {
+    function toList(
+        RLPItem memory item
+    ) internal pure returns (RLPItem[] memory) {
         (uint256 payload_mem_ptr, uint256 payload_len) = _payload(item);
         RLPItem[] memory result = new RLPItem[](20);
         uint256 items = 0;
@@ -39,7 +43,7 @@ library RLPReader {
             uint256 item_len = _itemLength(curr_ptr);
             if (items == result.length) {
                 RLPItem[] memory newResult = new RLPItem[](items * 2);
-                for(uint i=0; i < items; i++){
+                for (uint i = 0; i < items; i++) {
                     newResult[i] = result[i];
                 }
                 result = newResult;
@@ -48,15 +52,17 @@ library RLPReader {
             items++;
             curr_ptr += item_len;
         }
-        
+
         RLPItem[] memory trimmed_result = new RLPItem[](items);
         for (uint256 i = 0; i < items; i++) {
             trimmed_result[i] = result[i];
         }
         return trimmed_result;
     }
-    
-    function toRlpItem(bytes memory self) internal pure returns (RLPItem memory) {
+
+    function toRlpItem(
+        bytes memory self
+    ) internal pure returns (RLPItem memory) {
         uint256 memPtr;
         assembly {
             memPtr := add(self, 0x20)
@@ -74,7 +80,9 @@ library RLPReader {
         return first_byte >= 0xc0;
     }
 
-    function _payload(RLPItem memory item) private pure returns (uint256, uint256) {
+    function _payload(
+        RLPItem memory item
+    ) private pure returns (uint256, uint256) {
         uint256 ptr = item.memPtr;
         uint256 len = item.len;
         uint8 first_byte;
@@ -118,13 +126,18 @@ library RLPReader {
             return len + uint256(len_len) + 1;
         }
     }
-    
-    function _toUint(uint256 memPtr, uint256 len) private pure returns (uint256) {
+
+    function _toUint(
+        uint256 memPtr,
+        uint256 len
+    ) private pure returns (uint256) {
         uint256 result = 0;
         for (uint256 i = 0; i < len; i++) {
             uint8 b;
             uint256 p = memPtr + i;
-            assembly { b := byte(0, mload(p)) }
+            assembly {
+                b := byte(0, mload(p))
+            }
             result = (result << 8) | b;
         }
         return result;

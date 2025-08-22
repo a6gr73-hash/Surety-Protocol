@@ -8,6 +8,7 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./CollateralVault.sol";
 
+// ⭐ FIX: Updated interface to use srtStakeBlockNumber
 interface ICollateralVault {
     function usdcFreeOf(address user) external view returns (uint256);
 
@@ -29,33 +30,35 @@ interface ICollateralVault {
 
     function slashSRT(address user, uint256 amount, address recipient) external;
 
-    function srtStakeTimestamp(address user) external view returns (uint256);
+    function srtStakeBlockNumber(address user) external view returns (uint256);
 }
 
 contract InstantSettlement is Ownable, ReentrancyGuard {
-    // ⭐ FIX: Made immutable for security and gas savings
     ICollateralVault public immutable vault;
     IERC20 public immutable usdc;
     IERC20 public immutable srt;
 
     mapping(address => bool) public isMerchant;
     mapping(address => bool) public merchantInstantOnly;
+
     uint256 public softCap;
     uint256 public usdcCollateralPercent = 110;
     uint256 public initialSrtPercent = 150;
     uint256 public matureSrtPercent = 125;
-    uint256 public srtMaturity = 30 days;
+    // ⭐ FIX: Switched from a time duration to a block duration. Assumes ~12s block time.
+    // (30 days * 24 hours * 60 mins * 60 secs) / 12 secs/block = 216,000 blocks
+    uint256 public srtMaturityBlocks = 216000;
     uint256 public srtPrice;
 
     event MerchantRegistered(address indexed merchant, bool instantOnly);
     event MerchantUpdated(address indexed merchant, bool instantOnly);
     event SoftCapUpdated(uint256 newSoftCap);
     event SrtPriceUpdated(uint256 newPrice);
-    // ⭐ FIX: Added missing events
+    // ⭐ FIX: Updated event to use blocks instead of seconds
     event SrtParamsUpdated(
         uint256 initialPercent,
         uint256 maturePercent,
-        uint256 maturitySeconds
+        uint256 maturityBlocks
     );
     event UsdcCollateralPercentUpdated(uint256 percent);
 
@@ -101,27 +104,22 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         emit SrtPriceUpdated(_srtPrice);
     }
 
+    // ⭐ FIX: Updated function signature and logic to use blocks
     function setSrtParams(
         uint256 _initialPercent,
         uint256 _maturePercent,
-        uint256 _maturitySeconds
+        uint256 _maturityBlocks
     ) external onlyOwner {
         require(_initialPercent >= _maturePercent, "initial < mature");
         initialSrtPercent = _initialPercent;
         matureSrtPercent = _maturePercent;
-        srtMaturity = _maturitySeconds;
-        // ⭐ FIX: Emitting event
-        emit SrtParamsUpdated(
-            _initialPercent,
-            _maturePercent,
-            _maturitySeconds
-        );
+        srtMaturityBlocks = _maturityBlocks;
+        emit SrtParamsUpdated(_initialPercent, _maturePercent, _maturityBlocks);
     }
 
     function setUsdcCollateralPercent(uint256 _percent) external onlyOwner {
         require(_percent >= 100, "percent<100");
         usdcCollateralPercent = _percent;
-        // ⭐ FIX: Emitting event
         emit UsdcCollateralPercentUpdated(_percent);
     }
 
@@ -156,13 +154,16 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
             merchantInstantOnly[merchant],
             "merchant does not accept instant payments"
         );
+
         if (!collateralIsSRT) {
             uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) /
                 100;
             uint256 freeUSDC = vault.usdcFreeOf(msg.sender);
             require(freeUSDC >= requiredUSDC, "insufficient USDC collateral");
+
             vault.lockUSDC(msg.sender, requiredUSDC);
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
+
             if (ok) {
                 vault.releaseUSDC(msg.sender, requiredUSDC);
                 emit InstantPayment(
@@ -184,9 +185,13 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
             }
         } else {
             require(srtPrice > 0, "srtPrice not set");
-            uint256 stakeTs = vault.srtStakeTimestamp(msg.sender);
+
+            // ⭐ FIX: Updated maturity check to use block.number
+            uint256 stakeBlock = vault.srtStakeBlockNumber(msg.sender);
             uint256 percent = initialSrtPercent;
-            if (stakeTs > 0 && block.timestamp >= stakeTs + srtMaturity) {
+            if (
+                stakeBlock > 0 && block.number >= stakeBlock + srtMaturityBlocks
+            ) {
                 percent = matureSrtPercent;
             }
 
@@ -198,6 +203,7 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
 
             vault.lockSRT(msg.sender, requiredSRT);
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
+
             if (ok) {
                 vault.releaseSRT(msg.sender, requiredSRT);
                 emit InstantPayment(

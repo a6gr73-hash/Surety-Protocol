@@ -17,7 +17,8 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     mapping(address => uint256) public srtLocked;
     mapping(address => uint256) public usdcStake;
     mapping(address => uint256) public usdcLocked;
-    mapping(address => uint256) public srtStakeTimestamp;
+
+    mapping(address => uint256) public srtStakeBlockNumber; // ⭐ FIX: Switched from timestamp to block number
 
     // --- Events ---
     event SettlementContractSet(address indexed contractAddress);
@@ -61,7 +62,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         if (srtStake[msg.sender] == 0) {
-            srtStakeTimestamp[msg.sender] = block.timestamp;
+            srtStakeBlockNumber[msg.sender] = block.number; // ⭐ FIX: Store block.number
         }
         srtStake[msg.sender] += amount;
         require(
@@ -170,9 +171,8 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     function reimburseSlashedSRT(
         address user,
         uint256 amount
-    ) external onlySettlement {
+    ) external nonReentrant onlySettlement {
         srtStake[user] += amount;
-        // ⭐ FIX: Emit event before external call
         emit ReleasedSRT(user, amount);
         require(SRT.transfer(user, amount), "reimbursement failed");
     }
@@ -180,9 +180,8 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     function reimburseSlashedUSDC(
         address user,
         uint256 amount
-    ) external onlySettlement {
+    ) external nonReentrant onlySettlement {
         usdcStake[user] += amount;
-        // ⭐ FIX: Emit event before external call
         emit ReleasedUSDC(user, amount);
         require(USDC.transfer(user, amount), "reimbursement failed");
     }

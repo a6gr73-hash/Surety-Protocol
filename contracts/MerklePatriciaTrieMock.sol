@@ -6,17 +6,17 @@ import "./libraries/MerklePatriciaTrie.sol";
 
 contract MerklePatriciaTrieMock {
     function verifyInclusion(
-        bytes[] memory proof, 
-        bytes32 root, 
-        bytes memory key, 
+        bytes[] memory proof,
+        bytes32 root,
+        bytes memory key,
         bytes memory value
     ) public pure returns (bool) {
         return MerklePatriciaTrie.verifyInclusion(proof, root, key, value);
     }
 
     function get(
-        bytes[] memory proof, 
-        bytes32 root, 
+        bytes[] memory proof,
+        bytes32 root,
         bytes memory key
     ) public pure returns (bytes memory) {
         return MerklePatriciaTrie.get(proof, root, key);

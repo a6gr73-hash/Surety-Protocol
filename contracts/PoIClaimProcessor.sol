@@ -80,7 +80,10 @@ contract PoIClaimProcessor is Ownable, EIP712 {
             );
     }
 
-    function _verify(bytes32 claimId, bytes memory signature) internal pure returns (address) {
+    function _verify(
+        bytes32 claimId,
+        bytes memory signature
+    ) internal pure returns (address) {
         return ECDSA.recover(claimId, signature);
     }
 
@@ -111,13 +114,16 @@ contract PoIClaimProcessor is Ownable, EIP712 {
             sourceShardRoot,
             targetShardRoot
         );
-        require(claims[claimId].payer == address(0), "PoI: claim already submitted");
+        require(
+            claims[claimId].payer == address(0),
+            "PoI: claim already submitted"
+        );
 
-        // The signer parameter was removed from _verify
         address recovered = _verify(claimId, signature);
         require(recovered == payer, "PoI: invalid signature");
 
-        // Use memory struct to avoid "stack too deep"
+        // ⭐ NOTE: This struct is intentionally declared without initialization
+        // to avoid a "stack too deep" error. All fields are set immediately below.
         Claim memory newClaim;
         newClaim.payer = payer;
         newClaim.merchant = merchant;
@@ -144,8 +150,14 @@ contract PoIClaimProcessor is Ownable, EIP712 {
     function verifyPoIClaim(bytes32 claimId) external onlyOwner {
         Claim storage c = claims[claimId];
         require(!c.isVerified, "PoI: already verified");
-        require(publishedRoots[c.sourceShardRoot], "PoI: source root not published");
-        require(publishedRoots[c.targetShardRoot], "PoI: target root not published");
+        require(
+            publishedRoots[c.sourceShardRoot],
+            "PoI: source root not published"
+        );
+        require(
+            publishedRoots[c.targetShardRoot],
+            "PoI: target root not published"
+        );
 
         c.isVerified = true;
         emit PoIClaimVerified(claimId, c.slashedAmount);
@@ -155,10 +167,6 @@ contract PoIClaimProcessor is Ownable, EIP712 {
         Claim storage c = claims[claimId];
         require(c.isVerified, "PoI: claim not verified");
         require(!c.isReimbursed, "PoI: already reimbursed");
-
-        // This contract does not hold funds.
-        // The Vault contract handles the reimbursement based on this verification.
-        // ⭐ REMOVED: IERC20(c.collateralToken).transfer(c.merchant, c.slashedAmount);
 
         c.isReimbursed = true;
         emit PoIClaimReimbursed(claimId, c.slashedAmount);
