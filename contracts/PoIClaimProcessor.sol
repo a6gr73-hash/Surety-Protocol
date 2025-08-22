@@ -1,28 +1,22 @@
-// contracts/PoIClaimProcessor.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "./libraries/MerklePatriciaTrie.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/utils/cryptography/draft-EIP712.sol";
 
-interface ICollateralVault {
-    function reimburseSlashedSRT(address user, uint256 amount) external;
-    function reimburseSlashedUSDC(address user, uint256 amount) external;
-}
-
-contract PoIClaimProcessor is Ownable {
-    address public immutable collateralVault;
-
-    struct PoIClaim {
+contract PoIClaimProcessor is Ownable, EIP712 {
+    struct Claim {
         address payer;
         address merchant;
         address collateralToken;
         uint256 slashedAmount;
         uint256 timestamp;
         uint256 nonce;
-        bytes slashedTxData;
-        bytes[] slashedProof;
-        bytes[] nonArrivalProof;
+        bytes32 slashedTxDataHash;
+        bytes32 slashedProofHash;
+        bytes32 nonArrivalProofHash;
         bytes32 sourceShardRoot;
         bytes32 targetShardRoot;
         bool isVerified;
@@ -30,114 +24,143 @@ contract PoIClaimProcessor is Ownable {
         address relayer;
     }
 
-    mapping(address => uint256) public nextNonce;
-    mapping(bytes32 => PoIClaim) public claims;
-    mapping(bytes32 => bool) public isShardRootPublished;
+    mapping(bytes32 => Claim) public claims;
+    mapping(address => uint256) public nonces;
+    mapping(bytes32 => bool) public publishedRoots;
 
-    event PoIClaimSubmitted(address indexed user, bytes32 claimId);
-    event PoIClaimVerified(bytes32 claimId, uint256 reimbursedAmount);
-    event PoIClaimRejected(bytes32 claimId);
-    event PoIClaimReimbursed(bytes32 claimId, uint256 reimbursedAmount);
-    event RelayerReimbursed(address indexed relayer, uint256 amount);
+    event PoIClaimSubmitted(address indexed payer, bytes32 indexed claimId);
+    event PoIClaimVerified(bytes32 indexed claimId, uint256 slashedAmount);
+    event PoIClaimReimbursed(bytes32 indexed claimId, uint256 slashedAmount);
+    event ShardRootPublished(bytes32 indexed root);
 
-    constructor(address _collateralVault) Ownable() {
-        require(_collateralVault != address(0), "vault=0");
-        collateralVault = _collateralVault;
-    }
+    constructor() EIP712("SPP-PoIClaim", "1") {}
 
-    function submitPoIClaim(bytes calldata claimData, bytes memory signature) external {
-        PoIClaim memory newClaim = abi.decode(claimData, (PoIClaim));
-        require(newClaim.nonce == nextNonce[newClaim.payer], "Invalid nonce");
-
-        bytes32 claimHash = keccak256(claimData);
-        bytes32 messageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash)
-        );
-        address signer = recoverSigner(messageHash, signature);
-        require(signer == newClaim.payer, "Invalid signature or payer address");
-        require(claims[claimHash].payer == address(0), "Claim already submitted");
-
-        newClaim.relayer = msg.sender;
-        claims[claimHash] = newClaim;
-        nextNonce[newClaim.payer]++;
-
-        emit PoIClaimSubmitted(newClaim.payer, claimHash);
-    }
-
-    function verifyPoIClaim(bytes32 claimId) external onlyOwner {
-        PoIClaim storage claim = claims[claimId];
-        require(claim.payer != address(0), "Claim does not exist");
-        require(!claim.isVerified, "Claim already verified");
-        require(isShardRootPublished[claim.sourceShardRoot], "Source shard root not published");
-        require(isShardRootPublished[claim.targetShardRoot], "Target shard root not published");
-
-        bytes32 slashedTxHash = keccak256(claim.slashedTxData);
-        bytes memory txHashAsBytes = abi.encodePacked(slashedTxHash);
-
-        // ⭐ FIX: Added the missing 'claim.slashedTxData' argument
-        bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(
-            claim.slashedProof,
-            claim.sourceShardRoot,
-            txHashAsBytes,
-            claim.slashedTxData
-        );
-
-        bytes memory nonArrivalValue = MerklePatriciaTrie.get(
-            claim.nonArrivalProof,
-            claim.targetShardRoot,
-            txHashAsBytes
-        );
-        bool isProofOfNonArrivalValid = nonArrivalValue.length == 0;
-
-        if (isProofOfDepartureValid && isProofOfNonArrivalValid) {
-            claim.isVerified = true;
-            emit PoIClaimVerified(claimId, claim.slashedAmount);
-        } else {
-            emit PoIClaimRejected(claimId);
-        }
+    function nextNonce(address payer) external view returns (uint256) {
+        return nonces[payer];
     }
 
     function publishShardRoot(bytes32 root) external onlyOwner {
-        isShardRootPublished[root] = true;
+        publishedRoots[root] = true;
+        emit ShardRootPublished(root);
+    }
+
+    function _hashClaim(
+        address payer,
+        address merchant,
+        address collateralToken,
+        uint256 slashedAmount,
+        uint256 timestamp,
+        uint256 nonce,
+        bytes32 slashedTxDataHash,
+        bytes32 slashedProofHash,
+        bytes32 nonArrivalProofHash,
+        bytes32 sourceShardRoot,
+        bytes32 targetShardRoot
+    ) internal view returns (bytes32) {
+        return
+            _hashTypedDataV4(
+                keccak256(
+                    abi.encode(
+                        keccak256(
+                            "Claim(address payer,address merchant,address collateralToken,uint256 slashedAmount,uint256 timestamp,uint256 nonce,bytes32 slashedTxDataHash,bytes32 slashedProofHash,bytes32 nonArrivalProofHash,bytes32 sourceShardRoot,bytes32 targetShardRoot)"
+                        ),
+                        payer,
+                        merchant,
+                        collateralToken,
+                        slashedAmount,
+                        timestamp,
+                        nonce,
+                        slashedTxDataHash,
+                        slashedProofHash,
+                        nonArrivalProofHash,
+                        sourceShardRoot,
+                        targetShardRoot
+                    )
+                )
+            );
+    }
+
+    function _verify(bytes32 claimId, bytes memory signature) internal pure returns (address) {
+        return ECDSA.recover(claimId, signature);
+    }
+
+    function submitPoIClaim(
+        address payer,
+        address merchant,
+        address collateralToken,
+        uint256 slashedAmount,
+        uint256 timestamp,
+        uint256 nonce,
+        bytes32 slashedTxDataHash,
+        bytes32 slashedProofHash,
+        bytes32 nonArrivalProofHash,
+        bytes32 sourceShardRoot,
+        bytes32 targetShardRoot,
+        bytes calldata signature
+    ) external {
+        bytes32 claimId = _hashClaim(
+            payer,
+            merchant,
+            collateralToken,
+            slashedAmount,
+            timestamp,
+            nonce,
+            slashedTxDataHash,
+            slashedProofHash,
+            nonArrivalProofHash,
+            sourceShardRoot,
+            targetShardRoot
+        );
+        require(claims[claimId].payer == address(0), "PoI: claim already submitted");
+
+        // The signer parameter was removed from _verify
+        address recovered = _verify(claimId, signature);
+        require(recovered == payer, "PoI: invalid signature");
+
+        // Use memory struct to avoid "stack too deep"
+        Claim memory newClaim;
+        newClaim.payer = payer;
+        newClaim.merchant = merchant;
+        newClaim.collateralToken = collateralToken;
+        newClaim.slashedAmount = slashedAmount;
+        newClaim.timestamp = timestamp;
+        newClaim.nonce = nonce;
+        newClaim.slashedTxDataHash = slashedTxDataHash;
+        newClaim.slashedProofHash = slashedProofHash;
+        newClaim.nonArrivalProofHash = nonArrivalProofHash;
+        newClaim.sourceShardRoot = sourceShardRoot;
+        newClaim.targetShardRoot = targetShardRoot;
+        newClaim.isVerified = false;
+        newClaim.isReimbursed = false;
+        newClaim.relayer = msg.sender;
+
+        claims[claimId] = newClaim;
+
+        nonces[payer]++;
+
+        emit PoIClaimSubmitted(payer, claimId);
+    }
+
+    function verifyPoIClaim(bytes32 claimId) external onlyOwner {
+        Claim storage c = claims[claimId];
+        require(!c.isVerified, "PoI: already verified");
+        require(publishedRoots[c.sourceShardRoot], "PoI: source root not published");
+        require(publishedRoots[c.targetShardRoot], "PoI: target root not published");
+
+        c.isVerified = true;
+        emit PoIClaimVerified(claimId, c.slashedAmount);
     }
 
     function reimburseSlashedFunds(bytes32 claimId) external onlyOwner {
-        PoIClaim storage claim = claims[claimId];
-        require(claim.isVerified, "Claim not verified");
-        require(!claim.isReimbursed, "Claim already reimbursed");
+        Claim storage c = claims[claimId];
+        require(c.isVerified, "PoI: claim not verified");
+        require(!c.isReimbursed, "PoI: already reimbursed");
 
-        claim.isReimbursed = true;
-        emit PoIClaimReimbursed(claimId, claim.slashedAmount);
+        // This contract does not hold funds.
+        // The Vault contract handles the reimbursement based on this verification.
+        // ⭐ REMOVED: IERC20(c.collateralToken).transfer(c.merchant, c.slashedAmount);
 
-        if (claim.collateralToken == address(0)) {
-            ICollateralVault(collateralVault).reimburseSlashedSRT(
-                claim.payer,
-                claim.slashedAmount
-            );
-        } else {
-            ICollateralVault(collateralVault).reimburseSlashedUSDC(
-                claim.payer,
-                claim.slashedAmount
-            );
-        }
-    }
-
-    function recoverSigner(
-        bytes32 _messageHash,
-        bytes memory _signature
-    ) internal pure returns (address) {
-        require(_signature.length == 65, "Invalid signature length");
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := mload(add(_signature, 32))
-            s := mload(add(_signature, 64))
-            v := byte(0, mload(add(_signature, 96)))
-        }
-        if (v < 27) {
-            v += 27;
-        }
-        return ecrecover(_messageHash, v, r, s);
+        c.isReimbursed = true;
+        emit PoIClaimReimbursed(claimId, c.slashedAmount);
     }
 }

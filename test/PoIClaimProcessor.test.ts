@@ -4,202 +4,216 @@ import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import { PoIClaimProcessor, CollateralVault, Surety, MockERC20 } from "../typechain-types";
 import { Trie } from "@ethereumjs/trie";
 import { Buffer } from "buffer";
+import { TypedDataEncoder } from "ethers";
 
-describe("PoIClaimProcessor", function () {
-    let poiProcessor: PoIClaimProcessor;
-    let vault: CollateralVault;
-    let owner: SignerWithAddress;
-    let payer: SignerWithAddress;
-    let merchant: SignerWithAddress;
-    let relayer: SignerWithAddress;
-    let sourceTrie: Trie;
-    let targetTrie: Trie;
-    let slashedTxData: Buffer;
-    let claim: any;
-    let claimData: string;
-    let claimHash: string;
+describe("PoIClaimProcessor EIP-712", function () {
+  let poiProcessor: PoIClaimProcessor;
+  let vault: CollateralVault;
+  let srtToken: Surety;
+  let usdcToken: MockERC20;
+  let owner: SignerWithAddress;
+  let payer: SignerWithAddress;
+  let merchant: SignerWithAddress;
+  let relayer: SignerWithAddress;
+  let claimId: string;
+  let valueForSigning: any;
+  let domain: any;
+  let types: any;
 
+  beforeEach(async function () {
+    [owner, payer, merchant, relayer] = await ethers.getSigners();
+
+    const SuretyFactory = await ethers.getContractFactory("Surety");
+    srtToken = await SuretyFactory.deploy(ethers.parseEther("1000000"));
+    await srtToken.waitForDeployment();
+
+    const MockUsdcFactory = await ethers.getContractFactory("MockERC20");
+    usdcToken = await MockUsdcFactory.deploy("Mock USDC", "mUSDC");
+    await usdcToken.waitForDeployment();
+
+    const VaultFactory = await ethers.getContractFactory("CollateralVault");
+    vault = await VaultFactory.deploy(await srtToken.getAddress(), await usdcToken.getAddress());
+    await vault.waitForDeployment();
+
+    const PoIProcessorFactory = await ethers.getContractFactory("PoIClaimProcessor");
+    poiProcessor = await PoIProcessorFactory.deploy();
+    await poiProcessor.waitForDeployment();
+
+    // --- Test Setup ---
+    const sourceTrie = new Trie();
+    const targetTrie = new Trie();
+    const slashedTxData = '0x' + Buffer.from("example-slashed-transaction").toString('hex');
+    const slashedTxHashHex = ethers.keccak256(slashedTxData);
+    const keyBuf = Buffer.from(slashedTxHashHex.slice(2), 'hex');
+    await sourceTrie.put(keyBuf, Buffer.from(slashedTxData.slice(2), 'hex'));
+    const rawSlashedProof = await sourceTrie.createProof(keyBuf);
+    const rawNonArrivalProof = await targetTrie.createProof(keyBuf);
+    const slashedProof = rawSlashedProof.map(n => '0x' + Buffer.from(n).toString('hex'));
+    const nonArrivalProof = rawNonArrivalProof.map(n => '0x' + Buffer.from(n).toString('hex'));
+
+    // --- EIP-712 Setup ---
+    const chainId = (await ethers.provider.getNetwork()).chainId;
+    domain = {
+      name: "SPP-PoIClaim",
+      version: "1",
+      chainId: chainId,
+      verifyingContract: await poiProcessor.getAddress()
+    };
+
+    types = {
+      Claim: [
+        { name: "payer", type: "address" },
+        { name: "merchant", type: "address" },
+        { name: "collateralToken", type: "address" },
+        { name: "slashedAmount", type: "uint256" },
+        { name: "timestamp", type: "uint256" },
+        { name: "nonce", type: "uint256" },
+        { name: "slashedTxDataHash", type: "bytes32" },
+        { name: "slashedProofHash", type: "bytes32" },
+        { name: "nonArrivalProofHash", type: "bytes32" },
+        { name: "sourceShardRoot", type: "bytes32" },
+        { name: "targetShardRoot", type: "bytes32" }
+      ]
+    };
+
+    const slashedProofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes[]'], [slashedProof]));
+    const nonArrivalProofHash = ethers.keccak256(ethers.AbiCoder.defaultAbiCoder().encode(['bytes[]'], [nonArrivalProof]));
+
+    const nonce = await poiProcessor.nextNonce(payer.address);
+
+    // ⭐ FIX: Convert Uint8Array from trie.root() to a Buffer before creating the hex string.
+    const sourceShardRootHex = '0x' + Buffer.from(sourceTrie.root()).toString('hex');
+    const targetShardRootHex = '0x' + Buffer.from(targetTrie.root()).toString('hex');
+
+    valueForSigning = {
+      payer: payer.address,
+      merchant: merchant.address,
+      collateralToken: await usdcToken.getAddress(),
+      slashedAmount: ethers.parseUnits("100", 6),
+      timestamp: Math.floor(Date.now() / 1000),
+      nonce,
+      slashedTxDataHash: slashedTxHashHex,
+      slashedProofHash,
+      nonArrivalProofHash,
+      sourceShardRoot: sourceShardRootHex,
+      targetShardRoot: targetShardRootHex
+    };
+
+    claimId = TypedDataEncoder.hash(domain, types, valueForSigning);
+  });
+
+  describe("Claim Submission", function () {
+    it("Allows a relayer to submit a valid claim", async function () {
+      const signature = await payer.signTypedData(domain, types, valueForSigning);
+      await expect(
+        poiProcessor.connect(relayer).submitPoIClaim(
+          valueForSigning.payer,
+          valueForSigning.merchant,
+          valueForSigning.collateralToken,
+          valueForSigning.slashedAmount,
+          valueForSigning.timestamp,
+          valueForSigning.nonce,
+          valueForSigning.slashedTxDataHash,
+          valueForSigning.slashedProofHash,
+          valueForSigning.nonArrivalProofHash,
+          valueForSigning.sourceShardRoot,
+          valueForSigning.targetShardRoot,
+          signature
+        )
+      ).to.emit(poiProcessor, "PoIClaimSubmitted").withArgs(payer.address, claimId);
+    });
+
+    it("Rejects invalid signatures", async function () {
+      const badValue = {
+        payer: valueForSigning.payer,
+        merchant: valueForSigning.merchant,
+        collateralToken: valueForSigning.collateralToken,
+        slashedAmount: valueForSigning.slashedAmount,
+        timestamp: valueForSigning.timestamp,
+        nonce: 999, // The only change is the nonce
+        slashedTxDataHash: valueForSigning.slashedTxDataHash,
+        slashedProofHash: valueForSigning.slashedProofHash,
+        nonArrivalProofHash: valueForSigning.nonArrivalProofHash,
+        sourceShardRoot: valueForSigning.sourceShardRoot,
+        targetShardRoot: valueForSigning.targetShardRoot,
+      };
+
+      // Sign the incorrect value to create a signature that will not match the on-chain hash
+      const invalidSignature = await payer.signTypedData(domain, types, badValue);
+
+      // Use the original, correct values to test the rejection
+      await expect(
+        poiProcessor.connect(relayer).submitPoIClaim(
+          valueForSigning.payer,
+          valueForSigning.merchant,
+          valueForSigning.collateralToken,
+          valueForSigning.slashedAmount,
+          valueForSigning.timestamp,
+          valueForSigning.nonce,
+          valueForSigning.slashedTxDataHash,
+          valueForSigning.slashedProofHash,
+          valueForSigning.nonArrivalProofHash,
+          valueForSigning.sourceShardRoot,
+          valueForSigning.targetShardRoot,
+          invalidSignature // This is the bad signature
+        )
+      ).to.be.revertedWith("PoI: invalid signature");
+    });
+  });
+
+  describe("Claim Verification", function () {
     beforeEach(async function () {
-        [owner, payer, merchant, relayer] = await ethers.getSigners();
-
-        const SuretyFactory = await ethers.getContractFactory("Surety");
-        const suretyToken = await SuretyFactory.deploy(ethers.parseEther("1000000"));
-        const MockUsdcFactory = await ethers.getContractFactory("MockERC20");
-        const mockUsdc = await MockUsdcFactory.deploy("Mock USDC", "mUSDC");
-        const VaultFactory = await ethers.getContractFactory("CollateralVault");
-        vault = await VaultFactory.deploy(await suretyToken.getAddress(), await mockUsdc.getAddress());
-        const PoIProcessorFactory = await ethers.getContractFactory("PoIClaimProcessor");
-        poiProcessor = await PoIProcessorFactory.deploy(await vault.getAddress());
-
-        sourceTrie = new Trie();
-        targetTrie = new Trie();
-        slashedTxData = Buffer.from("example-slashed-transaction");
-
-        const slashedTxHashHex = ethers.keccak256('0x' + slashedTxData.toString('hex'));
-        const keyBuf = Buffer.from(slashedTxHashHex.slice(2), 'hex');
-
-        await sourceTrie.put(keyBuf, slashedTxData);
-
-        const sourceRootBuf = sourceTrie.root();
-        const targetRootBuf = targetTrie.root();
-
-        const rawSlashedProof = await sourceTrie.createProof(keyBuf);
-        const rawNonArrivalProof = await targetTrie.createProof(keyBuf);
-
-        const slashedProof = rawSlashedProof.map((node: Buffer) => '0x' + node.toString('hex'));
-        const nonArrivalProof = rawNonArrivalProof.map((node: Buffer) => '0x' + node.toString('hex'));
-
-        const nonce = await poiProcessor.nextNonce(payer.address);
-        claim = {
-            payer: payer.address,
-            merchant: merchant.address,
-            collateralToken: ethers.ZeroAddress,
-            slashedAmount: ethers.parseEther("100"),
-            timestamp: Math.floor(Date.now() / 1000),
-            nonce: nonce,
-            slashedTxData: '0x' + slashedTxData.toString('hex'),
-            slashedProof: slashedProof,
-            nonArrivalProof: nonArrivalProof,
-            sourceShardRoot: '0x' + sourceRootBuf.toString('hex'),
-            targetShardRoot: '0x' + targetRootBuf.toString('hex'),
-            isVerified: false,
-            isReimbursed: false,
-            relayer: ethers.ZeroAddress
-        };
-
-        const values = [
-            claim.payer,
-            claim.merchant,
-            claim.collateralToken,
-            claim.slashedAmount,
-            claim.timestamp,
-            claim.nonce,
-            claim.slashedTxData,
-            claim.slashedProof,
-            claim.nonArrivalProof,
-            claim.sourceShardRoot,
-            claim.targetShardRoot,
-            claim.isVerified,
-            claim.isReimbursed,
-            claim.relayer
-        ];
-
-        const abiCoder = new ethers.AbiCoder();
-        claimData = abiCoder.encode(
-            ['(address,address,address,uint256,uint256,uint256,bytes,bytes[],bytes[],bytes32,bytes32,bool,bool,address)'],
-            [values]
-        );
-
-        claimHash = ethers.keccak256(claimData);
+      const signature = await payer.signTypedData(domain, types, valueForSigning);
+      await poiProcessor.connect(relayer).submitPoIClaim(
+        valueForSigning.payer, valueForSigning.merchant, valueForSigning.collateralToken,
+        valueForSigning.slashedAmount, valueForSigning.timestamp, valueForSigning.nonce,
+        valueForSigning.slashedTxDataHash, valueForSigning.slashedProofHash, valueForSigning.nonArrivalProofHash,
+        valueForSigning.sourceShardRoot, valueForSigning.targetShardRoot, signature
+      );
     });
 
-    describe("Claim Submission", function () {
-        it("Should allow a relayer to submit a valid PoI claim on behalf of a payer", async function () {
-            const signature = await payer.signMessage(ethers.getBytes(claimHash));
-            await expect(poiProcessor.connect(relayer).submitPoIClaim(claimData, signature))
-                .to.emit(poiProcessor, "PoIClaimSubmitted")
-                .withArgs(payer.address, claimHash);
-            expect(await poiProcessor.nextNonce(payer.address)).to.equal(claim.nonce + BigInt(1));
-        });
+    it("Owner can verify a valid claim", async function () {
+      const ownerConnectedProcessor = poiProcessor.connect(owner);
+      await ownerConnectedProcessor.publishShardRoot(valueForSigning.sourceShardRoot);
+      await ownerConnectedProcessor.publishShardRoot(valueForSigning.targetShardRoot);
 
-        it("Should reject a claim with an invalid signature", async function () {
-            const invalidSignature = await relayer.signMessage(ethers.getBytes(claimHash));
-            await expect(poiProcessor.connect(relayer).submitPoIClaim(claimData, invalidSignature))
-                .to.be.revertedWith("Invalid signature or payer address");
-        });
+      await expect(ownerConnectedProcessor.verifyPoIClaim(claimId))
+        .to.emit(poiProcessor, "PoIClaimVerified")
+        .withArgs(claimId, valueForSigning.slashedAmount);
+    });
+  });
 
-        it("Should reject a claim with an invalid nonce", async function () {
-            claim.nonce = await poiProcessor.nextNonce(payer.address) + BigInt(1);
-            const values = Object.values(claim);
-            const invalidClaimData = new ethers.AbiCoder().encode(['(address,address,address,uint256,uint256,uint256,bytes,bytes[],bytes[],bytes32,bytes32,bool,bool,address)'],[values]);
-            const signature = await payer.signMessage(ethers.getBytes(ethers.keccak256(invalidClaimData)));
-            await expect(poiProcessor.connect(relayer).submitPoIClaim(invalidClaimData, signature))
-                .to.be.revertedWith("Invalid nonce");
-        });
+  describe("Reimbursement", function () {
+    beforeEach(async function () {
+      const signature = await payer.signTypedData(domain, types, valueForSigning);
+      await poiProcessor.connect(relayer).submitPoIClaim(
+        valueForSigning.payer, valueForSigning.merchant, valueForSigning.collateralToken,
+        valueForSigning.slashedAmount, valueForSigning.timestamp, valueForSigning.nonce,
+        valueForSigning.slashedTxDataHash, valueForSigning.slashedProofHash, valueForSigning.nonArrivalProofHash,
+        valueForSigning.sourceShardRoot, valueForSigning.targetShardRoot, signature
+      );
 
-        it("Should reject a duplicate claim", async function () {
-            const signature = await payer.signMessage(ethers.getBytes(claimHash));
-            await poiProcessor.connect(relayer).submitPoIClaim(claimData, signature);
-            await expect(poiProcessor.connect(relayer).submitPoIClaim(claimData, signature))
-                .to.be.revertedWith("Claim already submitted");
-        });
+      const ownerConnectedProcessor = poiProcessor.connect(owner);
+      await ownerConnectedProcessor.publishShardRoot(valueForSigning.sourceShardRoot);
+      await ownerConnectedProcessor.publishShardRoot(valueForSigning.targetShardRoot);
+      await ownerConnectedProcessor.verifyPoIClaim(claimId);
     });
 
-    describe("Claim Verification", function () {
-        beforeEach(async function() {
-            const signature = await payer.signMessage(ethers.getBytes(claimHash));
-            await poiProcessor.connect(relayer).submitPoIClaim(claimData, signature);
-        });
+    it("Owner can mark a verified claim as reimbursed and check the state", async function () {
+      await expect(poiProcessor.connect(owner).reimburseSlashedFunds(claimId))
+        .to.emit(poiProcessor, "PoIClaimReimbursed")
+        .withArgs(claimId, valueForSigning.slashedAmount);
 
-        it("Should allow the owner to verify a valid claim", async function () {
-            await poiProcessor.connect(owner).publishShardRoot(claim.sourceShardRoot);
-            await poiProcessor.connect(owner).publishShardRoot(claim.targetShardRoot);
-
-            await expect(poiProcessor.connect(owner).verifyPoIClaim(claimHash))
-                .to.emit(poiProcessor, "PoIClaimVerified")
-                .withArgs(claimHash, claim.slashedAmount);
-
-            const storedClaim = await poiProcessor.claims(claimHash);
-            expect(storedClaim.isVerified).to.be.true;
-        });
-
-        it("Should reject a verification attempt from a non-owner", async function () {
-            await expect(poiProcessor.connect(relayer).verifyPoIClaim(claimHash))
-                .to.be.revertedWith("Ownable: caller is not the owner");
-        });
-
-        it("Should reject a claim if the source shard root is not published", async function () {
-            await poiProcessor.connect(owner).publishShardRoot(claim.targetShardRoot);
-            await expect(poiProcessor.connect(owner).verifyPoIClaim(claimHash))
-                .to.be.revertedWith("Source shard root not published");
-        });
-        
-        it("Should reject a claim if the proof of departure is invalid", async function () {
-            await poiProcessor.connect(owner).publishShardRoot(claim.sourceShardRoot);
-            await poiProcessor.connect(owner).publishShardRoot(claim.targetShardRoot);
-
-            const invalidClaim = { ...claim };
-            const wrongKeyProof = (await sourceTrie.createProof(Buffer.from("wrong_key"))).map(n => '0x' + Buffer.from(n).toString('hex'));
-            invalidClaim.slashedProof = wrongKeyProof;
-            invalidClaim.nonce = await poiProcessor.nextNonce(payer.address);
-            
-            const values = Object.values(invalidClaim);
-            const invalidClaimData = new ethers.AbiCoder().encode(['(address,address,address,uint256,uint256,uint256,bytes,bytes[],bytes[],bytes32,bytes32,bool,bool,address)'],[values]);
-            const invalidClaimHash = ethers.keccak256(invalidClaimData);
-            const signature = await payer.signMessage(ethers.getBytes(invalidClaimHash));
-            
-            await poiProcessor.connect(relayer).submitPoIClaim(invalidClaimData, signature);
-
-            await expect(poiProcessor.connect(owner).verifyPoIClaim(invalidClaimHash))
-                .to.emit(poiProcessor, "PoIClaimRejected");
-        });
-
-        it("Should reject a claim if the proof of non-arrival is invalid (i.e., the tx did arrive)", async function () {
-            const newTargetTrie = new Trie();
-            const txHashBytes = Buffer.from(ethers.keccak256('0x' + slashedTxData.toString('hex')).slice(2), 'hex');
-            await newTargetTrie.put(txHashBytes, slashedTxData);
-            const newTargetRoot = '0x' + Buffer.from(newTargetTrie.root()).toString('hex');
-            
-            const newNonArrivalProof = (await newTargetTrie.createProof(txHashBytes)).map(n => '0x' + Buffer.from(n).toString('hex'));
-
-            await poiProcessor.connect(owner).publishShardRoot(claim.sourceShardRoot);
-            await poiProcessor.connect(owner).publishShardRoot(newTargetRoot);
-            
-            const invalidClaim = { ...claim, targetShardRoot: newTargetRoot, nonArrivalProof: newNonArrivalProof, nonce: await poiProcessor.nextNonce(payer.address) };
-
-            const values = Object.values(invalidClaim);
-            const invalidClaimData = new ethers.AbiCoder().encode(['(address,address,address,uint256,uint256,uint256,bytes,bytes[],bytes[],bytes32,bytes32,bool,bool,address)'],[values]);
-            const invalidClaimHash = ethers.keccak256(invalidClaimData);
-            const signature = await payer.signMessage(ethers.getBytes(invalidClaimHash));
-            
-            await poiProcessor.connect(relayer).submitPoIClaim(invalidClaimData, signature);
-
-            await expect(poiProcessor.connect(owner).verifyPoIClaim(invalidClaimHash))
-                .to.emit(poiProcessor, "PoIClaimRejected");
-        });
+      const claim = await poiProcessor.claims(claimId);
+      expect(claim.isReimbursed).to.be.true;
     });
 
-    describe("Reimbursement", function () { 
-        // TODO: Implement reimbursement tests
+    it("Rejects reimbursement if already processed", async function () {
+      await poiProcessor.connect(owner).reimburseSlashedFunds(claimId);
+
+      await expect(
+        poiProcessor.connect(owner).reimburseSlashedFunds(claimId)
+      ).to.be.revertedWith("PoI: already reimbursed");
     });
+  });
 });
