@@ -5,10 +5,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./libraries/MerklePatriciaTrie.sol";
 
 // --- Interfaces ---
-
 interface ICollateralVault {
     function lockSRT(address user, uint256 amount) external;
 
@@ -34,8 +32,15 @@ interface IPoIClaimProcessor {
 contract FiniteSettlement is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
-    // --- State Variables ---
+    // --- Enums ---
+    enum Status {
+        Pending,
+        Resolved,
+        Failed,
+        Expired
+    }
 
+    // --- State Variables ---
     ICollateralVault public immutable collateralVault;
     IPoIClaimProcessor public immutable poiProcessor;
     IERC20 public immutable usdc;
@@ -48,16 +53,16 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         uint256 paymentAmount;
         uint256 collateralAmount;
         uint256 escrowBlock;
-        bool resolved;
+        Status status;
     }
 
     mapping(bytes32 => Dispute) public disputes;
 
-    uint256 public usdcCollateralPercent;
-    uint256 public srtCollateralPercent;
-    uint256 public srtPrice;
-    uint256 public protocolFeePercent;
+    uint256 public immutable usdcCollateralPercent;
+    uint256 public immutable srtCollateralPercent;
+    uint256 public immutable protocolFeePercent;
     uint256 public constant DISPUTE_TIMEOUT_BLOCKS = 21600; // ~72 hours
+    uint256 public constant srtPrice = 0; // To be set later
 
     // --- Events ---
     event PaymentInitiated(
@@ -66,108 +71,122 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         address indexed recipient,
         uint256 amount
     );
-    event PaymentSucceeded(bytes32 indexed paymentId);
-    event DisputeCreated(bytes32 indexed paymentId, uint256 collateralAmount);
+    event PaymentExecuted(bytes32 indexed paymentId);
+    event PaymentFailed(bytes32 indexed paymentId);
     event DisputeResolved(bytes32 indexed paymentId, address indexed winner);
     event EscrowClaimed(bytes32 indexed paymentId, address indexed payer);
 
     constructor(
-        address _vaultAddress,
-        address _poiAddress,
-        address _usdcAddress,
-        address _srtAddress
+        address vaultAddress,
+        address poiAddress,
+        address usdcAddress,
+        address srtAddress
     ) {
-        collateralVault = ICollateralVault(_vaultAddress);
-        poiProcessor = IPoIClaimProcessor(_poiAddress);
-        usdc = IERC20(_usdcAddress);
-        srt = IERC20(_srtAddress);
+        collateralVault = ICollateralVault(vaultAddress);
+        poiProcessor = IPoIClaimProcessor(poiAddress);
+        usdc = IERC20(usdcAddress);
+        srt = IERC20(srtAddress);
 
         usdcCollateralPercent = 110;
         srtCollateralPercent = 125;
         protocolFeePercent = 1;
     }
 
+    /**
+     * @notice Initiates a payment by locking collateral and creating a dispute record.
+     * @param recipient The address of the payment recipient.
+     * @param amount The amount of USDC to be paid.
+     * @param useSrtCollateral A boolean to determine whether to use SRT or USDC as collateral.
+     */
     function initiatePayment(
-        address _recipient,
-        uint256 _amount,
-        bool _useSrtCollateral
+        address recipient,
+        uint256 amount,
+        bool useSrtCollateral
     ) external nonReentrant returns (bytes32 paymentId) {
         paymentId = keccak256(
-            abi.encodePacked(block.timestamp, msg.sender, _recipient, _amount)
+            abi.encodePacked(block.timestamp, msg.sender, recipient, amount)
         );
-        emit PaymentInitiated(paymentId, msg.sender, _recipient, _amount);
+        require(
+            disputes[paymentId].payer == address(0),
+            "FS: Payment ID exists"
+        );
 
         uint256 requiredCollateral;
-        address collateralToken = _useSrtCollateral
+        address collateralToken = useSrtCollateral
             ? address(srt)
             : address(usdc);
 
-        // ⭐ 1. Lock the appropriate collateral in the Vault
-        if (_useSrtCollateral) {
-            requiredCollateral = (_amount * srtCollateralPercent) / 100;
+        if (useSrtCollateral) {
+            requiredCollateral = (amount * srtCollateralPercent) / 100;
             collateralVault.lockSRT(msg.sender, requiredCollateral);
         } else {
-            requiredCollateral = (_amount * usdcCollateralPercent) / 100;
+            requiredCollateral = (amount * usdcCollateralPercent) / 100;
             collateralVault.lockUSDC(msg.sender, requiredCollateral);
         }
 
-        // ⭐ 2. Attempt the USDC payment
-        bool success = usdc.transferFrom(msg.sender, _recipient, _amount);
-        if (success) {
-            // ⭐ 3. On success, release the collateral back to the payer
-            if (_useSrtCollateral) {
-                collateralVault.releaseSRT(msg.sender, requiredCollateral);
-            } else {
-                collateralVault.releaseUSDC(msg.sender, requiredCollateral);
-            }
-            emit PaymentSucceeded(paymentId);
-        } else {
-            // ⭐ 4. On failure, slash the collateral to this contract (the escrow)
-            if (_useSrtCollateral) {
-                collateralVault.slashSRT(
-                    msg.sender,
-                    requiredCollateral,
-                    address(this)
-                );
-            } else {
-                collateralVault.slashUSDC(
-                    msg.sender,
-                    requiredCollateral,
-                    address(this)
-                );
-            }
+        disputes[paymentId] = Dispute({
+            payer: msg.sender,
+            recipient: recipient,
+            collateralToken: collateralToken,
+            paymentAmount: amount,
+            collateralAmount: requiredCollateral,
+            escrowBlock: block.number,
+            status: Status.Pending
+        });
+        emit PaymentInitiated(paymentId, msg.sender, recipient, amount);
+    }
 
-            // ⭐ 5. Create a dispute record
-            disputes[paymentId] = Dispute({
-                payer: msg.sender,
-                recipient: _recipient,
-                collateralToken: collateralToken,
-                paymentAmount: _amount,
-                collateralAmount: requiredCollateral,
-                escrowBlock: block.number,
-                resolved: false
-            });
-            emit DisputeCreated(paymentId, requiredCollateral);
+    /**
+     * @notice Executes a pending payment.
+     * @param paymentId The ID of the payment to execute.
+     */
+    function executePayment(bytes32 paymentId) external nonReentrant {
+        Dispute storage dispute = disputes[paymentId];
+        require(dispute.status == Status.Pending, "FS: Not a pending payment");
+
+        bool success = usdc.transferFrom(
+            dispute.payer,
+            dispute.recipient,
+            dispute.paymentAmount
+        );
+
+        if (success) {
+            if (dispute.collateralToken == address(srt)) {
+                collateralVault.releaseSRT(
+                    dispute.payer,
+                    dispute.collateralAmount
+                );
+            } else {
+                collateralVault.releaseUSDC(
+                    dispute.payer,
+                    dispute.collateralAmount
+                );
+            }
+            dispute.status = Status.Resolved;
+            emit PaymentExecuted(paymentId);
+        } else {
+            collateralVault.slashUSDC(
+                dispute.payer,
+                dispute.collateralAmount,
+                address(this)
+            );
+            dispute.status = Status.Failed;
+            emit PaymentFailed(paymentId);
         }
     }
 
     /**
      * @notice Resolves a dispute after a watcher has submitted a valid proof of non-arrival.
-     * @param _paymentId The ID of the payment to resolve.
-     * @dev For this phase, this function is owner-only for security.
+     * @param paymentId The ID of the payment to resolve.
      */
-    function resolveDispute(
-        bytes32 _paymentId
-    ) external nonReentrant onlyOwner {
-        Dispute storage dispute = disputes[_paymentId];
-        require(dispute.escrowBlock > 0, "FS: Dispute does not exist");
-        require(!dispute.resolved, "FS: Dispute already resolved");
+    function resolveDispute(bytes32 paymentId) external nonReentrant onlyOwner {
+        Dispute storage dispute = disputes[paymentId];
+        require(dispute.status == Status.Failed, "FS: Dispute not failed");
 
-        // ⭐ FIX: Update state before external calls to prevent reentrancy
-        dispute.resolved = true;
+        dispute.status = Status.Resolved;
 
         require(
-            poiProcessor.isPayoutAuthorized(_paymentId),
+            poiProcessor.isPayoutAuthorized(paymentId),
             "FS: Payout not authorized by PoI"
         );
 
@@ -177,7 +196,6 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
             recipientPayout -
             feeAmount;
 
-        // ⭐ FIX: Use SafeERC20 helpers for secure transfers
         IERC20(dispute.collateralToken).safeTransfer(
             dispute.recipient,
             recipientPayout
@@ -188,31 +206,28 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         );
         IERC20(dispute.collateralToken).safeTransfer(owner(), feeAmount);
 
-        emit DisputeResolved(_paymentId, dispute.recipient);
+        emit DisputeResolved(paymentId, dispute.recipient);
     }
 
     /**
      * @notice Allows a payer to reclaim their collateral if a dispute times out.
-     * @param _paymentId The ID of the payment to claim.
+     * @param paymentId The ID of the payment to claim.
      */
-    function claimExpiredEscrow(bytes32 _paymentId) external nonReentrant {
-        Dispute storage dispute = disputes[_paymentId];
+    function claimExpiredEscrow(bytes32 paymentId) external nonReentrant {
+        Dispute storage dispute = disputes[paymentId];
         require(dispute.payer == msg.sender, "FS: Not the payer");
-        require(dispute.escrowBlock > 0, "FS: Dispute does not exist");
-        require(!dispute.resolved, "FS: Dispute already resolved");
+        require(dispute.status == Status.Failed, "FS: Dispute not failed");
         require(
             block.number >= dispute.escrowBlock + DISPUTE_TIMEOUT_BLOCKS,
             "FS: Timeout not expired"
         );
 
-        // ⭐ FIX: Update state before external calls to prevent reentrancy
-        dispute.resolved = true;
+        dispute.status = Status.Expired;
 
-        // ⭐ FIX: Use SafeERC20 helpers for secure transfers
         IERC20(dispute.collateralToken).safeTransfer(
             dispute.payer,
             dispute.collateralAmount
         );
-        emit EscrowClaimed(_paymentId, dispute.payer);
+        emit EscrowClaimed(paymentId, dispute.payer);
     }
 }

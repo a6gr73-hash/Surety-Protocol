@@ -15,7 +15,6 @@ describe("CollateralVault Staking", function () {
         [owner, addr1, addr2] = await ethers.getSigners();
 
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        // ⭐ FIX: Deploy the Surety contract with no constructor arguments.
         suretyToken = await SuretyFactory.deploy();
         await suretyToken.waitForDeployment();
 
@@ -26,22 +25,22 @@ describe("CollateralVault Staking", function () {
         const VaultFactory = await ethers.getContractFactory("CollateralVault");
         vault = await VaultFactory.deploy(await suretyToken.getAddress(), await mockUsdc.getAddress());
         await vault.waitForDeployment();
-        
-        // The owner now holds the total supply, so we transfer some to addr1 for the test.
+
         await suretyToken.connect(owner).transfer(addr1.address, ethers.parseEther("1000"));
     });
 
     describe("Basic Deposit and Withdraw", function () {
         it("Should deploy the vault with the correct token addresses", async function () {
-            expect(await vault.SRT()).to.equal(await suretyToken.getAddress());
-            expect(await vault.USDC()).to.equal(await mockUsdc.getAddress());
+            // ⭐ FIX: Use lowercase srt() and usdc() to match the updated contract
+            expect(await vault.srt()).to.equal(await suretyToken.getAddress());
+            expect(await vault.usdc()).to.equal(await mockUsdc.getAddress());
         });
 
         it("Should allow a user to deposit tokens and update free stake", async function () {
             const depositAmount = ethers.parseEther("500");
             await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
             await vault.connect(addr1).depositSRT(depositAmount);
-            
+
             expect(await vault.srtFreeOf(addr1.address)).to.equal(depositAmount);
         });
 
@@ -65,7 +64,7 @@ describe("CollateralVault Staking", function () {
             await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
             await vault.connect(addr1).depositSRT(depositAmount);
             await vault.connect(addr1).withdrawSRT(withdrawAmount);
-            
+
             expect(await vault.srtFreeOf(addr1.address)).to.equal(depositAmount - withdrawAmount);
         });
 
@@ -95,7 +94,7 @@ describe("CollateralVault Staking", function () {
         it("Should allow the authorized settlement contract to lock a user's stake", async function () {
             const lockAmount = ethers.parseEther("300");
             await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
+
             expect(await vault.srtFreeOf(addr1.address)).to.equal(ethers.parseEther("200"));
             expect(await vault.srtLockedOf(addr1.address)).to.equal(lockAmount);
         });
@@ -109,7 +108,7 @@ describe("CollateralVault Staking", function () {
         it("Should prevent a user from withdrawing funds that are locked", async function () {
             const lockAmount = ethers.parseEther("400");
             await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
+
             await expect(vault.connect(addr1).withdrawSRT(ethers.parseEther("101")))
                 .to.be.revertedWith("insufficient SRT");
         });
@@ -119,7 +118,7 @@ describe("CollateralVault Staking", function () {
             const releaseAmount = ethers.parseEther("150");
             await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
             await vault.connect(settlementContract).releaseSRT(addr1.address, releaseAmount);
-            
+
             expect(await vault.srtFreeOf(addr1.address)).to.equal(ethers.parseEther("250"));
             expect(await vault.srtLockedOf(addr1.address)).to.equal(ethers.parseEther("250"));
         });
@@ -128,7 +127,7 @@ describe("CollateralVault Staking", function () {
             const lockAmount = ethers.parseEther("350");
             const slashAmount = ethers.parseEther("200");
             await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
+
             const recipientBalanceBefore = await suretyToken.balanceOf(settlementContract.address);
             await vault.connect(settlementContract).slashSRT(addr1.address, slashAmount, settlementContract.address);
             const recipientBalanceAfter = await suretyToken.balanceOf(settlementContract.address);
