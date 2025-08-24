@@ -12,13 +12,15 @@ describe("WatcherRegistry", function () {
     let nonWatcher: SignerWithAddress;
     
     const MIN_STAKE = ethers.parseEther("1000");
+    // ⭐ FIX: Changed to UNSTAKE_BLOCKS to match the contract
     const UNSTAKE_BLOCKS = 216000;
 
     beforeEach(async function () {
         [owner, watcher, nonWatcher] = await ethers.getSigners();
         
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        suretyToken = await SuretyFactory.deploy(ethers.parseEther("10000000"));
+        // ⭐ FIX: Deploy the Surety contract with no constructor arguments
+        suretyToken = await SuretyFactory.deploy();
         await suretyToken.waitForDeployment();
         
         const CollateralVaultFactory = await ethers.getContractFactory("CollateralVault");
@@ -57,14 +59,12 @@ describe("WatcherRegistry", function () {
 
         it("Should fail registration if minimum stake is not met", async function () {
             const insufficientStake = MIN_STAKE - ethers.parseEther("1");
-            // ⭐ FIX: Updated revert reason string
             await expect(watcherRegistry.connect(watcher).registerWatcher(insufficientStake))
                 .to.be.revertedWith("WatcherRegistry: Insufficient stake amount");
         });
 
         it("Should fail if the user is already a watcher", async function () {
             await watcherRegistry.connect(watcher).registerWatcher(MIN_STAKE);
-            // ⭐ FIX: Updated revert reason string
             await expect(watcherRegistry.connect(watcher).registerWatcher(MIN_STAKE))
                 .to.be.revertedWith("WatcherRegistry: Already registered");
         });
@@ -82,14 +82,12 @@ describe("WatcherRegistry", function () {
         });
 
         it("Should fail if a non-watcher tries to deregister", async function () {
-            // ⭐ FIX: Updated revert reason string
             await expect(watcherRegistry.connect(nonWatcher).deregisterWatcher())
                 .to.be.revertedWith("WatcherRegistry: Not a registered watcher");
         });
 
         it("Should fail to claim funds before the unstake period is over", async function () {
             await watcherRegistry.connect(watcher).deregisterWatcher();
-            // ⭐ FIX: Updated revert reason string
             await expect(watcherRegistry.connect(watcher).claimUnstakedFunds())
                 .to.be.revertedWith("WatcherRegistry: Unstake period not over");
         });
@@ -97,6 +95,7 @@ describe("WatcherRegistry", function () {
         it("Should allow a watcher to claim funds after the unstake period", async function () {
             await watcherRegistry.connect(watcher).deregisterWatcher();
             
+            // ⭐ FIX: Mine the correct number of blocks to simulate the unstake period
             await ethers.provider.send('hardhat_mine', [ethers.toQuantity(UNSTAKE_BLOCKS + 1)]);
 
             await watcherRegistry.connect(watcher).claimUnstakedFunds();

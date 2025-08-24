@@ -7,17 +7,14 @@ describe("Surety Token", function () {
     let suretyToken: Surety;
     let owner: SignerWithAddress;
     let addr1: SignerWithAddress;
-    let initialSupply: bigint;
+    let addr2: SignerWithAddress;
 
     beforeEach(async function () {
-        [owner, addr1] = await ethers.getSigners();
-
-        // Define the initial supply, which is required by the constructor
-        initialSupply = ethers.parseEther("1000000000"); // 1 Billion SRT
-
-        // Deploy the Surety contract with the initial supply as an argument
+        [owner, addr1, addr2] = await ethers.getSigners();
+        
+        // Deploy the Surety contract with no constructor arguments
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        suretyToken = await SuretyFactory.deploy(initialSupply);
+        suretyToken = await SuretyFactory.deploy();
         await suretyToken.waitForDeployment();
     });
 
@@ -26,7 +23,8 @@ describe("Surety Token", function () {
         expect(await suretyToken.symbol()).to.equal("SRT");
     });
 
-    it("Should mint the total supply to the deployer's address", async function () {
+    it("Should mint the total fixed supply to the deployer's address", async function () {
+        const initialSupply = ethers.parseEther("1000000000");
         const totalSupply = await suretyToken.totalSupply();
         const ownerBalance = await suretyToken.balanceOf(owner.address);
 
@@ -34,46 +32,35 @@ describe("Surety Token", function () {
         expect(ownerBalance).to.equal(initialSupply);
     });
 
-    it("Should allow the owner to mint additional tokens", async function () {
-        const mintAmount = ethers.parseEther("500");
-        const initialOwnerBalance = await suretyToken.balanceOf(owner.address);
-
-        // Mint new tokens to addr1
-        await suretyToken.connect(owner).mint(addr1.address, mintAmount);
-
-        // Check addr1's new balance
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(mintAmount);
-
-        // Check that total supply has increased
-        const newTotalSupply = await suretyToken.totalSupply();
-        expect(newTotalSupply).to.equal(initialSupply + mintAmount);
-
-        // Owner's balance should be unchanged
-        expect(await suretyToken.balanceOf(owner.address)).to.equal(initialOwnerBalance);
-    });
-
     it("Should allow the owner to burn tokens from any address", async function () {
+        const transferAmount = ethers.parseEther("500");
         const burnAmount = ethers.parseEther("100");
-        const initialOwnerBalance = await suretyToken.balanceOf(owner.address);
 
-        // Owner burns tokens from their own address
-        await suretyToken.connect(owner).burn(owner.address, burnAmount);
+        // Transfer some tokens from the owner to addr1
+        await suretyToken.connect(owner).transfer(addr1.address, transferAmount);
 
-        // Check that owner's balance and total supply have decreased
-        const expectedBalance = initialOwnerBalance - burnAmount;
-        expect(await suretyToken.balanceOf(owner.address)).to.equal(expectedBalance);
-        expect(await suretyToken.totalSupply()).to.equal(initialSupply - burnAmount);
+        const initialAddr1Balance = await suretyToken.balanceOf(addr1.address);
+        const initialTotalSupply = await suretyToken.totalSupply();
+
+        // Owner burns tokens from addr1's address
+        await suretyToken.connect(owner).burn(addr1.address, burnAmount);
+        
+        const expectedAddr1Balance = initialAddr1Balance - burnAmount;
+        const expectedTotalSupply = initialTotalSupply - burnAmount;
+
+        expect(await suretyToken.balanceOf(addr1.address)).to.equal(expectedAddr1Balance);
+        expect(await suretyToken.totalSupply()).to.equal(expectedTotalSupply);
     });
 
-    it("Should not allow non-owners to mint or burn tokens", async function () {
-        const amount = ethers.parseEther("100");
-
-        // addr1 attempts to mint
-        await expect(suretyToken.connect(addr1).mint(addr1.address, amount))
+    it("Should not allow non-owners to burn tokens", async function () {
+        const burnAmount = ethers.parseEther("100");
+        
+        await expect(suretyToken.connect(addr1).burn(owner.address, burnAmount))
             .to.be.revertedWith("Ownable: caller is not the owner");
-
-        // addr1 attempts to burn
-        await expect(suretyToken.connect(addr1).burn(owner.address, amount))
-            .to.be.revertedWith("Ownable: caller is not the owner");
+    });
+    
+    it("Should not have a mint function", async function () {
+        const hasMintFunction = typeof (suretyToken as any).mint === "function";
+        expect(hasMintFunction).to.be.false;
     });
 });
