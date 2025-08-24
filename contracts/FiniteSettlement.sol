@@ -4,6 +4,7 @@ pragma solidity 0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./libraries/MerklePatriciaTrie.sol";
 
 // --- Interfaces ---
@@ -31,6 +32,8 @@ interface IPoIClaimProcessor {
 }
 
 contract FiniteSettlement is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
     // --- State Variables ---
 
     ICollateralVault public immutable collateralVault;
@@ -110,7 +113,6 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
 
         // ⭐ 2. Attempt the USDC payment
         bool success = usdc.transferFrom(msg.sender, _recipient, _amount);
-
         if (success) {
             // ⭐ 3. On success, release the collateral back to the payer
             if (_useSrtCollateral) {
@@ -161,28 +163,31 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         require(dispute.escrowBlock > 0, "FS: Dispute does not exist");
         require(!dispute.resolved, "FS: Dispute already resolved");
 
-        // ⭐ 1. Check with the PoIProcessor if a valid proof has been submitted
+        // ⭐ FIX: Update state before external calls to prevent reentrancy
+        dispute.resolved = true;
+
         require(
             poiProcessor.isPayoutAuthorized(_paymentId),
             "FS: Payout not authorized by PoI"
         );
 
-        // ⭐ 2. Calculate fees and payouts
         uint256 feeAmount = (dispute.paymentAmount * protocolFeePercent) / 100;
         uint256 recipientPayout = dispute.paymentAmount;
         uint256 payerRefund = dispute.collateralAmount -
             recipientPayout -
             feeAmount;
 
-        // ⭐ 3. Transfer funds
-        IERC20(dispute.collateralToken).transfer(
+        // ⭐ FIX: Use SafeERC20 helpers for secure transfers
+        IERC20(dispute.collateralToken).safeTransfer(
             dispute.recipient,
             recipientPayout
         );
-        IERC20(dispute.collateralToken).transfer(dispute.payer, payerRefund);
-        IERC20(dispute.collateralToken).transfer(owner(), feeAmount); // Fee to treasury
+        IERC20(dispute.collateralToken).safeTransfer(
+            dispute.payer,
+            payerRefund
+        );
+        IERC20(dispute.collateralToken).safeTransfer(owner(), feeAmount);
 
-        dispute.resolved = true;
         emit DisputeResolved(_paymentId, dispute.recipient);
     }
 
@@ -200,13 +205,14 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
             "FS: Timeout not expired"
         );
 
-        // ⭐ Transfer the full collateral amount back to the payer
-        IERC20(dispute.collateralToken).transfer(
+        // ⭐ FIX: Update state before external calls to prevent reentrancy
+        dispute.resolved = true;
+
+        // ⭐ FIX: Use SafeERC20 helpers for secure transfers
+        IERC20(dispute.collateralToken).safeTransfer(
             dispute.payer,
             dispute.collateralAmount
         );
-
-        dispute.resolved = true;
         emit EscrowClaimed(_paymentId, dispute.payer);
     }
 }

@@ -18,7 +18,6 @@ interface ICollateralVault {
 
 contract WatcherRegistry is Ownable, ReentrancyGuard {
     ICollateralVault public immutable collateralVault;
-
     // --- State Variables ---
     mapping(address => bool) public isWatcher;
     mapping(address => uint256) public unstakeRequestBlock;
@@ -61,9 +60,11 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             "WatcherRegistry: Insufficient stake amount"
         );
 
+        // ⭐ FIX: Update state BEFORE the external call to prevent reentrancy.
+        isWatcher[msg.sender] = true;
+
         collateralVault.lockSRT(msg.sender, amount);
 
-        isWatcher[msg.sender] = true;
         emit WatcherRegistered(msg.sender, amount);
     }
 
@@ -76,7 +77,6 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             isWatcher[msg.sender],
             "WatcherRegistry: Not a registered watcher"
         );
-
         unstakeRequestBlock[msg.sender] = block.number;
         emit WatcherDeregistered(msg.sender, block.number);
     }
@@ -97,7 +97,6 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             block.number >= unstakeRequestBlock[msg.sender] + UNSTAKE_BLOCKS,
             "WatcherRegistry: Unstake period not over"
         );
-
         uint256 lockedAmount = collateralVault.srtLocked(msg.sender);
         require(lockedAmount > 0, "WatcherRegistry: No funds to claim");
 
@@ -130,7 +129,6 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             recipient != address(0),
             "WatcherRegistry: Invalid recipient address"
         );
-
         collateralVault.slashSRT(watcher, amount, recipient);
         emit WatcherSlashed(watcher, recipient, amount);
     }

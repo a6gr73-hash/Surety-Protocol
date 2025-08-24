@@ -6,8 +6,11 @@ pragma solidity 0.8.20;
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract CollateralVault is ReentrancyGuard, Ownable {
+    using SafeERC20 for IERC20;
+
     IERC20 public immutable SRT;
     IERC20 public immutable USDC;
 
@@ -18,7 +21,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     mapping(address => uint256) public usdcStake;
     mapping(address => uint256) public usdcLocked;
 
-    mapping(address => uint256) public srtStakeBlockNumber; // ⭐ FIX: Switched from timestamp to block number
+    mapping(address => uint256) public srtStakeBlockNumber;
 
     // --- Events ---
     event SettlementContractSet(address indexed contractAddress);
@@ -62,13 +65,10 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         if (srtStake[msg.sender] == 0) {
-            srtStakeBlockNumber[msg.sender] = block.number; // ⭐ FIX: Store block.number
+            srtStakeBlockNumber[msg.sender] = block.number;
         }
         srtStake[msg.sender] += amount;
-        require(
-            SRT.transferFrom(msg.sender, address(this), amount),
-            "transferFrom failed"
-        );
+        SRT.safeTransferFrom(msg.sender, address(this), amount); // ⭐ FIX: Use safeTransferFrom
         emit DepositedSRT(msg.sender, amount);
     }
 
@@ -76,7 +76,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         require(amount > 0, "amount=0");
         require(srtStake[msg.sender] >= amount, "insufficient SRT");
         srtStake[msg.sender] -= amount;
-        require(SRT.transfer(msg.sender, amount), "transfer failed");
+        SRT.safeTransfer(msg.sender, amount); // ⭐ FIX: Use safeTransfer
         emit WithdrawnSRT(msg.sender, amount);
     }
 
@@ -111,17 +111,14 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         require(recipient != address(0), "recipient=0");
         require(srtLocked[user] >= amount, "insufficient locked");
         srtLocked[user] -= amount;
-        require(SRT.transfer(recipient, amount), "slash transfer failed");
+        SRT.safeTransfer(recipient, amount); // ⭐ FIX: Use safeTransfer
         emit SlashedSRT(user, recipient, amount);
     }
 
     function depositUSDC(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         usdcStake[msg.sender] += amount;
-        require(
-            USDC.transferFrom(msg.sender, address(this), amount),
-            "transferFrom failed"
-        );
+        USDC.safeTransferFrom(msg.sender, address(this), amount); // ⭐ FIX: Use safeTransferFrom
         emit DepositedUSDC(msg.sender, amount);
     }
 
@@ -129,7 +126,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         require(amount > 0, "amount=0");
         require(usdcStake[msg.sender] >= amount, "insufficient USDC");
         usdcStake[msg.sender] -= amount;
-        require(USDC.transfer(msg.sender, amount), "transfer failed");
+        USDC.safeTransfer(msg.sender, amount); // ⭐ FIX: Use safeTransfer
         emit WithdrawnUSDC(msg.sender, amount);
     }
 
@@ -164,7 +161,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         require(recipient != address(0), "recipient=0");
         require(usdcLocked[user] >= amount, "insufficient locked");
         usdcLocked[user] -= amount;
-        require(USDC.transfer(recipient, amount), "slash transfer failed");
+        USDC.safeTransfer(recipient, amount); // ⭐ FIX: Use safeTransfer
         emit SlashedUSDC(user, recipient, amount);
     }
 
@@ -174,7 +171,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     ) external nonReentrant onlySettlement {
         srtStake[user] += amount;
         emit ReleasedSRT(user, amount);
-        require(SRT.transfer(user, amount), "reimbursement failed");
+        SRT.safeTransfer(user, amount); // ⭐ FIX: Use safeTransfer
     }
 
     function reimburseSlashedUSDC(
@@ -183,7 +180,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     ) external nonReentrant onlySettlement {
         usdcStake[user] += amount;
         emit ReleasedUSDC(user, amount);
-        require(USDC.transfer(user, amount), "reimbursement failed");
+        USDC.safeTransfer(user, amount); // ⭐ FIX: Use safeTransfer
     }
 
     // --- Views ---
