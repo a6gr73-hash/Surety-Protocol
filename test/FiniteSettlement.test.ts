@@ -1,3 +1,5 @@
+// test/FiniteSettlement.test.ts
+
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
@@ -76,6 +78,9 @@ describe("FiniteSettlement (Refactored)", function () {
             
             const tx = await finiteSettlement.connect(payer).initiatePayment(recipient.address, USDC_PAYMENT_AMOUNT, false);
             const receipt = await tx.wait();
+            // FIX: Add a null check to satisfy TypeScript compiler.
+            if (!receipt) throw new Error("Transaction receipt is null");
+
             const event = receipt.logs.find((e: any) => e.fragment && e.fragment.name === 'PaymentInitiated');
             if (!event || !('args' in event)) throw new Error("PaymentInitiated event not found.");
             const paymentId = event.args[0];
@@ -103,19 +108,23 @@ describe("FiniteSettlement (Refactored)", function () {
         beforeEach(async function () {
             const tx = await finiteSettlement.connect(payer).initiatePayment(recipient.address, USDC_PAYMENT_AMOUNT, false);
             const receipt = await tx.wait();
+            // FIX: Add a null check to satisfy TypeScript compiler.
+            if (!receipt) throw new Error("Transaction receipt is null");
+
             const event = receipt.logs.find((e: any) => e.fragment && e.fragment.name === 'PaymentInitiated');
             if (!event || !('args' in event)) throw new Error("PaymentInitiated event not found.");
             paymentId = event.args[0];
 
-            await usdc.setShouldFail(true);
-            await finiteSettlement.connect(payer).executePayment(paymentId);
+            await finiteSettlement.connect(payer).handlePaymentFailure(paymentId);
+            
             failedTxKey = Buffer.from(ethers.randomBytes(32)); 
         });
 
         it("Should handle a failed payment and set the dispute status to Failed", async function () {
             const dispute = await finiteSettlement.disputes(paymentId);
             expect(dispute.status).to.equal(Status.Failed);
-            expect(await usdc.balanceOf(await finiteSettlement.getAddress())).to.be.above(0);
+            const collateralAmount = (USDC_PAYMENT_AMOUNT * 110n) / 100n;
+            expect(await usdc.balanceOf(await finiteSettlement.getAddress())).to.equal(collateralAmount);
         });
 
         it("Should resolve a failed dispute correctly after PoI authorization", async function () {

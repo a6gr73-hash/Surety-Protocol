@@ -1,3 +1,4 @@
+// contracts/FiniteSettlement.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -5,30 +6,22 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interfaces/ICollateralVault.sol";
 
 // --- Interfaces ---
-interface ICollateralVault {
-    function lockSRT(address user, uint256 amount) external;
-
-    function lockUSDC(address user, uint256 amount) external;
-
-    function releaseSRT(address user, uint256 amount) external;
-
-    function releaseUSDC(address user, uint256 amount) external;
-
-    function slashSRT(address user, uint256 amount, address recipient) external;
-
-    function slashUSDC(
-        address user,
-        uint256 amount,
-        address recipient
-    ) external;
-}
-
 interface IPoIClaimProcessor {
     function isPayoutAuthorized(bytes32 paymentId) external view returns (bool);
 }
 
+/**
+ * @title FiniteSettlement
+ * @author FSP Architect
+ * @notice The core logic contract for the Finite Settlement Protocol.
+ * @dev This contract manages the lifecycle of a guaranteed payment. It handles
+ * payment initiation, collateral locking, execution, and a dispute resolution
+ * process for failed payments. It relies on a PoIClaimProcessor for proof
+ * verification and a CollateralVault for fund management.
+ */
 contract FiniteSettlement is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -46,6 +39,16 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
     IERC20 public immutable usdc;
     IERC20 public immutable srt;
 
+    /**
+     * @dev Stores all data for a payment's dispute lifecycle.
+     * @param payer The address initiating the payment and posting collateral.
+     * @param recipient The intended recipient of the payment.
+     * @param collateralToken The token used for collateral (SRT or USDC).
+     * @param paymentAmount The amount of USDC to be paid.
+     * @param collateralAmount The amount of collateral locked for the payment.
+     * @param escrowBlock The block number when a payment failed and was escrowed.
+     * @param status The current status of the payment/dispute.
+     */
     struct Dispute {
         address payer;
         address recipient;
@@ -58,11 +61,10 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
 
     mapping(bytes32 => Dispute) public disputes;
 
+    uint256 public constant DISPUTE_TIMEOUT_BLOCKS = 21600; // ~72 hours
     uint256 public immutable usdcCollateralPercent;
     uint256 public immutable srtCollateralPercent;
     uint256 public immutable protocolFeePercent;
-    uint256 public constant DISPUTE_TIMEOUT_BLOCKS = 21600; // ~72 hours
-    uint256 public constant srtPrice = 0; // To be set later
 
     // --- Events ---
     event PaymentInitiated(
@@ -86,110 +88,154 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         poiProcessor = IPoIClaimProcessor(poiAddress);
         usdc = IERC20(usdcAddress);
         srt = IERC20(srtAddress);
-
         usdcCollateralPercent = 110;
         srtCollateralPercent = 125;
         protocolFeePercent = 1;
     }
 
     /**
-     * @notice Initiates a payment by locking collateral and creating a dispute record.
-     * @param recipient The address of the payment recipient.
+     * @notice Initiates a payment by locking collateral in the vault.
+     * @dev Creates a unique paymentId based on inputs and `block.timestamp`.
+     * The use of timestamp here is for ID uniqueness, not for time-based logic,
+     * and is safe from miner manipulation in this context.
+     * @param recipient The address that will receive the payment.
      * @param amount The amount of USDC to be paid.
-     * @param useSrtCollateral A boolean to determine whether to use SRT or USDC as collateral.
+     * @param useSrtCollateral If true, lock SRT as collateral; otherwise, lock USDC.
+     * @return paymentId The unique identifier for this payment.
      */
     function initiatePayment(
         address recipient,
         uint256 amount,
         bool useSrtCollateral
     ) external nonReentrant returns (bytes32 paymentId) {
+        // --- CHECKS ---
         paymentId = keccak256(
             abi.encodePacked(block.timestamp, msg.sender, recipient, amount)
         );
-        require(
-            disputes[paymentId].payer == address(0),
-            "FS: Payment ID exists"
-        );
+        require(disputes[paymentId].payer == address(0), "FS: Payment ID exists");
 
         uint256 requiredCollateral;
-        address collateralToken = useSrtCollateral
-            ? address(srt)
-            : address(usdc);
+        address collateralToken = useSrtCollateral ? address(srt) : address(usdc);
 
-        if (useSrtCollateral) {
-            requiredCollateral = (amount * srtCollateralPercent) / 100;
-            collateralVault.lockSRT(msg.sender, requiredCollateral);
-        } else {
-            requiredCollateral = (amount * usdcCollateralPercent) / 100;
-            collateralVault.lockUSDC(msg.sender, requiredCollateral);
-        }
-
+        // --- EFFECTS ---
         disputes[paymentId] = Dispute({
             payer: msg.sender,
             recipient: recipient,
             collateralToken: collateralToken,
             paymentAmount: amount,
-            collateralAmount: requiredCollateral,
-            escrowBlock: block.number,
+            collateralAmount: 0, 
+            escrowBlock: 0, 
             status: Status.Pending
         });
+
+        // --- INTERACTIONS ---
+        if (useSrtCollateral) {
+            requiredCollateral = (amount * srtCollateralPercent) / 100;
+            disputes[paymentId].collateralAmount = requiredCollateral;
+            collateralVault.lockSRT(msg.sender, requiredCollateral);
+        } else {
+            requiredCollateral = (amount * usdcCollateralPercent) / 100;
+            disputes[paymentId].collateralAmount = requiredCollateral;
+            collateralVault.lockUSDC(msg.sender, requiredCollateral);
+        }
+        
         emit PaymentInitiated(paymentId, msg.sender, recipient, amount);
     }
-
+    
     /**
-     * @notice Executes a pending payment.
+     * @notice Executes a successful payment.
+     * @dev This function performs the USDC transfer from payer to recipient and
+     * releases the payer's collateral. It follows the Checks-Effects-Interactions
+     * pattern to prevent reentrancy.
+     * The `usdc.safeTransferFrom` call uses `dispute.payer` as the `from` address.
+     * This is secure because the `dispute.payer` is set to `msg.sender` in `initiatePayment`,
+     * ensuring that only the original payer's funds can be moved, and only after they
+     * have explicitly started the process.
      * @param paymentId The ID of the payment to execute.
      */
     function executePayment(bytes32 paymentId) external nonReentrant {
         Dispute storage dispute = disputes[paymentId];
+        
+        // --- CHECKS ---
         require(dispute.status == Status.Pending, "FS: Not a pending payment");
 
-        bool success = usdc.transferFrom(
+        // --- EFFECTS ---
+        dispute.status = Status.Resolved;
+
+        // --- INTERACTIONS ---
+        usdc.safeTransferFrom(
             dispute.payer,
             dispute.recipient,
             dispute.paymentAmount
         );
 
-        if (success) {
-            if (dispute.collateralToken == address(srt)) {
-                collateralVault.releaseSRT(
-                    dispute.payer,
-                    dispute.collateralAmount
-                );
-            } else {
-                collateralVault.releaseUSDC(
-                    dispute.payer,
-                    dispute.collateralAmount
-                );
-            }
-            dispute.status = Status.Resolved;
-            emit PaymentExecuted(paymentId);
+        if (dispute.collateralToken == address(srt)) {
+            collateralVault.releaseSRT(dispute.payer, dispute.collateralAmount);
+        } else {
+            collateralVault.releaseUSDC(dispute.payer, dispute.collateralAmount);
+        }
+
+        emit PaymentExecuted(paymentId);
+    }
+
+    /**
+     * @notice Handles a payment that has failed to execute off-chain.
+     * @dev This function is called when a payment does not complete. It moves the
+     * dispute to the 'Failed' state and slashes the payer's collateral, holding it
+     * in escrow within this contract to await resolution.
+     * @param paymentId The ID of the failed payment.
+     */
+    function handlePaymentFailure(bytes32 paymentId) external nonReentrant {
+        Dispute storage dispute = disputes[paymentId];
+        
+        // --- CHECKS ---
+        require(dispute.status == Status.Pending, "FS: Not a pending payment");
+
+        // --- EFFECTS ---
+        dispute.status = Status.Failed;
+        dispute.escrowBlock = block.number;
+
+        // --- INTERACTIONS ---
+        if (dispute.collateralToken == address(srt)) {
+            collateralVault.slashSRT(
+                dispute.payer,
+                dispute.collateralAmount,
+                address(this)
+            );
         } else {
             collateralVault.slashUSDC(
                 dispute.payer,
                 dispute.collateralAmount,
                 address(this)
             );
-            dispute.status = Status.Failed;
-            emit PaymentFailed(paymentId);
         }
+
+        emit PaymentFailed(paymentId);
     }
-
+    
     /**
-     * @notice Resolves a dispute after a watcher has submitted a valid proof of non-arrival.
-     * @param paymentId The ID of the payment to resolve.
+     * @notice Resolves a failed dispute after a valid Proof of Inclusion is processed.
+     * @dev Can only be called by the owner. It checks for authorization from the
+     * PoIProcessor, then distributes the escrowed collateral: the payment amount
+     * to the recipient, a protocol fee to the owner, and the remainder back to the payer.
+     * @param paymentId The ID of the dispute to resolve.
      */
-    function resolveDispute(bytes32 paymentId) external nonReentrant onlyOwner {
+    function resolveDispute(
+        bytes32 paymentId
+    ) external nonReentrant onlyOwner {
         Dispute storage dispute = disputes[paymentId];
+
+        // --- CHECKS ---
         require(dispute.status == Status.Failed, "FS: Dispute not failed");
-
-        dispute.status = Status.Resolved;
-
         require(
             poiProcessor.isPayoutAuthorized(paymentId),
             "FS: Payout not authorized by PoI"
         );
+        
+        // --- EFFECTS ---
+        dispute.status = Status.Resolved;
 
+        // --- INTERACTIONS ---
         uint256 feeAmount = (dispute.paymentAmount * protocolFeePercent) / 100;
         uint256 recipientPayout = dispute.paymentAmount;
         uint256 payerRefund = dispute.collateralAmount -
@@ -200,34 +246,39 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
             dispute.recipient,
             recipientPayout
         );
-        IERC20(dispute.collateralToken).safeTransfer(
-            dispute.payer,
-            payerRefund
-        );
+        IERC20(dispute.collateralToken).safeTransfer(dispute.payer, payerRefund);
         IERC20(dispute.collateralToken).safeTransfer(owner(), feeAmount);
 
         emit DisputeResolved(paymentId, dispute.recipient);
     }
 
     /**
-     * @notice Allows a payer to reclaim their collateral if a dispute times out.
-     * @param paymentId The ID of the payment to claim.
+     * @notice Allows the payer to reclaim their full collateral if a dispute times out.
+     * @dev This is a backstop mechanism. If a payment fails and no valid proof is
+     * submitted within the `DISPUTE_TIMEOUT_BLOCKS` window, the original payer can
+     * retrieve their collateral.
+     * @param paymentId The ID of the expired dispute.
      */
     function claimExpiredEscrow(bytes32 paymentId) external nonReentrant {
         Dispute storage dispute = disputes[paymentId];
+        
+        // --- CHECKS ---
         require(dispute.payer == msg.sender, "FS: Not the payer");
         require(dispute.status == Status.Failed, "FS: Dispute not failed");
         require(
             block.number >= dispute.escrowBlock + DISPUTE_TIMEOUT_BLOCKS,
             "FS: Timeout not expired"
         );
-
+        
+        // --- EFFECTS ---
         dispute.status = Status.Expired;
 
+        // --- INTERACTIONS ---
         IERC20(dispute.collateralToken).safeTransfer(
             dispute.payer,
             dispute.collateralAmount
         );
+        
         emit EscrowClaimed(paymentId, dispute.payer);
     }
 }
