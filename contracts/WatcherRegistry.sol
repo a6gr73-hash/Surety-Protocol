@@ -1,26 +1,32 @@
+// contracts/WatcherRegistry.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./interfaces/ICollateralVault.sol";
 
-// This interface defines the functions needed from the CollateralVault.
-// It is a best practice to define interfaces in the contract that uses them.
-interface ICollateralVault {
-    function srtLocked(address user) external view returns (uint256);
-
-    function lockSRT(address user, uint256 amount) external;
-
-    function releaseSRT(address user, uint256 amount) external;
-
-    function slashSRT(address user, uint256 amount, address recipient) external;
-}
-
+/**
+ * @title WatcherRegistry
+ * @author FSP Architect
+ * @notice Manages the registration, staking, and slashing of network watchers.
+ * @dev This contract is responsible for maintaining the list of active watchers
+ * and managing their SRT stakes via the CollateralVault. It now also includes
+ * a mechanism for the DAO/owner to distribute USDC stipends to watchers.
+ */
 contract WatcherRegistry is Ownable, ReentrancyGuard {
-    ICollateralVault public immutable collateralVault;
+    using SafeERC20 for IERC20;
+
     // --- State Variables ---
+    ICollateralVault public immutable collateralVault;
+    // NEW: The contract now needs to know about the USDC token to distribute stipends.
+    IERC20 public immutable usdc;
+
     mapping(address => bool) public isWatcher;
     mapping(address => uint256) public unstakeRequestBlock;
+
     uint256 public constant UNSTAKE_BLOCKS = 216000; // ~30 days
     uint256 public minWatcherStake;
 
@@ -34,24 +40,37 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
         uint256 slashedAmount
     );
     event MinWatcherStakeUpdated(uint256 newAmount);
+    // NEW: Event for when stipends are distributed.
+    event StipendsDistributed(uint256 totalAmount, uint256 watcherCount);
 
-    constructor(address _collateralVault, uint256 _minStake) Ownable() {
+    // MODIFIED: The constructor now accepts the USDC contract address.
+    constructor(
+        address _collateralVault,
+        address _usdcAddress,
+        uint256 _minStake
+    ) {
         require(
             _collateralVault != address(0),
             "WatcherRegistry: Vault address cannot be zero"
         );
         require(
+            _usdcAddress != address(0),
+            "WatcherRegistry: USDC address cannot be zero"
+        );
+        require(
             _minStake > 0,
             "WatcherRegistry: Minimum stake must be greater than zero"
         );
+
         collateralVault = ICollateralVault(_collateralVault);
+        usdc = IERC20(_usdcAddress);
         minWatcherStake = _minStake;
     }
 
     /**
      * @notice Allows an address to register as a watcher by locking a minimum amount of SRT.
-     * @param amount The amount of SRT to lock, which must be at least the minimum required stake.
-     * @dev The user must have already deposited and approved the necessary SRT in the CollateralVault.
+     * @dev The user must have already deposited the necessary SRT in the CollateralVault.
+     * @param amount The amount of SRT to lock, must be >= minWatcherStake.
      */
     function registerWatcher(uint256 amount) external nonReentrant {
         require(!isWatcher[msg.sender], "WatcherRegistry: Already registered");
@@ -60,9 +79,7 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             "WatcherRegistry: Insufficient stake amount"
         );
 
-        // ⭐ FIX: Update state BEFORE the external call to prevent reentrancy.
         isWatcher[msg.sender] = true;
-
         collateralVault.lockSRT(msg.sender, amount);
 
         emit WatcherRegistered(msg.sender, amount);
@@ -70,7 +87,6 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
 
     /**
      * @notice Initiates the deregistration process for a watcher, starting a time-lock.
-     * @dev The watcher's funds remain locked for the duration of UNSTAKE_BLOCKS.
      */
     function deregisterWatcher() external nonReentrant {
         require(
@@ -82,7 +98,7 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Allows a deregistered watcher to claim their locked stake after the unstake period has passed.
+     * @notice Allows a deregistered watcher to claim their locked stake after the unstake period.
      */
     function claimUnstakedFunds() external nonReentrant {
         require(
@@ -97,21 +113,20 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
             block.number >= unstakeRequestBlock[msg.sender] + UNSTAKE_BLOCKS,
             "WatcherRegistry: Unstake period not over"
         );
-        uint256 lockedAmount = collateralVault.srtLocked(msg.sender);
+
+        uint256 lockedAmount = collateralVault.srtLockedOf(msg.sender);
         require(lockedAmount > 0, "WatcherRegistry: No funds to claim");
 
-        // Update state BEFORE the external call to prevent reentrancy
         isWatcher[msg.sender] = false;
         delete unstakeRequestBlock[msg.sender];
 
-        // External call to the vault
         collateralVault.releaseSRT(msg.sender, lockedAmount);
 
         emit WatcherFundsClaimed(msg.sender, lockedAmount);
     }
 
     /**
-     * @notice Allows the owner (or a future DAO) to slash a watcher's stake for misbehavior.
+     * @notice Slashes a watcher's stake for misbehavior.
      * @param watcher The address of the watcher to be slashed.
      * @param amount The amount of SRT to slash from the watcher's locked funds.
      * @param recipient The address to receive the slashed funds.
@@ -134,7 +149,7 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
     }
 
     /**
-     * @notice Allows the owner to update the minimum required stake for new watchers.
+     * @notice Updates the minimum required stake for new watchers.
      * @param newMinStake The new minimum stake amount.
      */
     function setMinWatcherStake(uint256 newMinStake) external onlyOwner {
@@ -144,5 +159,36 @@ contract WatcherRegistry is Ownable, ReentrancyGuard {
         );
         minWatcherStake = newMinStake;
         emit MinWatcherStakeUpdated(newMinStake);
+    }
+
+    /**
+     * @notice NEW: Distributes USDC stipends to a batch of active watchers.
+     * @dev The contract must hold sufficient USDC (sent from the treasury) before this is called.
+     * The owner is responsible for providing a valid list of active watchers to avoid reverts.
+     * This batching mechanism is used to avoid unbounded loops and stay within block gas limits.
+     * @param watchers A list of watcher addresses to receive stipends.
+     * @param amountPerWatcher The amount of USDC to send to each watcher.
+     */
+    function distributeStipends(
+        address[] calldata watchers,
+        uint256 amountPerWatcher
+    ) external nonReentrant onlyOwner {
+        uint256 totalAmount = watchers.length * amountPerWatcher;
+        require(
+            usdc.balanceOf(address(this)) >= totalAmount,
+            "WatcherRegistry: Insufficient USDC balance for distribution"
+        );
+
+        for (uint i = 0; i < watchers.length; i++) {
+            address watcher = watchers[i];
+            // Ensure we are only paying active, staked watchers.
+            require(
+                isWatcher[watcher],
+                "WatcherRegistry: Cannot pay stipend to a non-watcher"
+            );
+            usdc.safeTransfer(watcher, amountPerWatcher);
+        }
+
+        emit StipendsDistributed(totalAmount, watchers.length);
     }
 }

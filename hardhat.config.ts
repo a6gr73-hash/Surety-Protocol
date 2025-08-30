@@ -1,6 +1,6 @@
 import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
-import "@typechain/hardhat";
+import "./scripts/triggerEvent";
 
 const config: HardhatUserConfig = {
   solidity: {
@@ -8,9 +8,16 @@ const config: HardhatUserConfig = {
     settings: {
       optimizer: {
         enabled: true,
-        runs: 200
+        runs: 200,
       },
-      viaIR: true, // helps with "stack too deep" errors
+      viaIR: true,
+    },
+  },
+  networks: {
+    hardhat: {
+      accounts: {
+        count: 60, // Provides 60 test accounts instead of the default 20
+      },
     },
   },
   paths: {
@@ -19,15 +26,6 @@ const config: HardhatUserConfig = {
     cache: "./cache",
     artifacts: "./artifacts",
   },
-  typechain: {
-    outDir: "typechain-types",
-    target: "ethers-v6",
-    alwaysGenerateOverloads: false,
-    externalArtifacts: [],
-  },
-  mocha: {
-    timeout: 20000
-  }
 };
 
 export default config;

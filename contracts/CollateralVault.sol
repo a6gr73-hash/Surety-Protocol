@@ -13,20 +13,18 @@ import "./interfaces/ICollateralVault.sol";
  * @author FSP Architect
  * @notice A secure vault for users to deposit and stake SRT and USDC collateral.
  * @dev This contract holds all user funds for the Finite Settlement Protocol.
- * It allows an authorized 'settlementContract' (e.g., FiniteSettlement or WatcherRegistry)
- * to lock, release, and slash collateral based on protocol rules. Direct deposits
- * and withdrawals of free stake are initiated by users themselves.
+ * It allows authorized 'settlement contracts' (e.g., FiniteSettlement, WatcherRegistry)
+ * to lock, release, and slash collateral based on protocol rules.
  */
 contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     using SafeERC20 for IERC20;
 
     // --- State Variables ---
-
     IERC20 public immutable srt;
     IERC20 public immutable usdc;
 
-    /// @notice The single, authorized address that can manage collateral locks.
-    address public settlementContract;
+    /// @notice Mapping of authorized contract addresses that can manage collateral locks.
+    mapping(address => bool) public isSettlementContract;
 
     /// @notice Mapping from user address to their free (unlocked) SRT balance.
     mapping(address => uint256) public srtStake;
@@ -36,13 +34,12 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     mapping(address => uint256) public usdcStake;
     /// @notice Mapping from user address to their locked USDC balance.
     mapping(address => uint256) public usdcLocked;
-
     /// @notice Tracks the block number of a user's first SRT deposit.
     mapping(address => uint256) public srtStakeBlockNumber;
 
     // --- Events ---
-
-    event SettlementContractSet(address indexed contractAddress);
+    event SettlementContractAdded(address indexed contractAddress);
+    event SettlementContractRemoved(address indexed contractAddress);
     event DepositedSRT(address indexed user, uint256 amount);
     event WithdrawnSRT(address indexed user, uint256 amount);
     event LockedSRT(address indexed user, uint256 amount);
@@ -63,17 +60,15 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     );
 
     // --- Modifiers ---
-
     /**
-     * @dev Throws if the caller is not the authorized settlement contract.
+     * @dev Throws if the caller is not an authorized settlement contract.
      */
     modifier onlySettlement() {
-        require(msg.sender == settlementContract, "not settlement");
+        require(isSettlementContract[msg.sender], "not settlement");
         _;
     }
 
     // --- Constructor ---
-
     constructor(address _srt, address _usdc) {
         require(_srt != address(0), "SRT=0");
         require(_usdc != address(0), "USDC=0");
@@ -82,26 +77,31 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     }
 
     // --- Admin Functions ---
+    /**
+     * @notice Adds an authorized settlement contract address.
+     * @dev Can only be called by the contract owner.
+     * @param _contractAddress The address of the settlement contract to add.
+     */
+    function addSettlementContract(address _contractAddress) external onlyOwner {
+        require(_contractAddress != address(0), "settlement=0");
+        require(!isSettlementContract[_contractAddress], "already authorized");
+        isSettlementContract[_contractAddress] = true;
+        emit SettlementContractAdded(_contractAddress);
+    }
 
     /**
-     * @notice Sets the authorized settlement contract address.
+     * @notice Removes an authorized settlement contract address.
      * @dev Can only be called by the contract owner.
-     * @param _settlementContract The address of the settlement contract.
+     * @param _contractAddress The address of the settlement contract to remove.
      */
-    function setSettlementContract(
-        address _settlementContract
-    ) external onlyOwner {
-        require(_settlementContract != address(0), "settlement=0");
-        settlementContract = _settlementContract;
-        emit SettlementContractSet(_settlementContract);
+    function removeSettlementContract(address _contractAddress) external onlyOwner {
+        require(isSettlementContract[_contractAddress], "not authorized");
+        isSettlementContract[_contractAddress] = false;
+        emit SettlementContractRemoved(_contractAddress);
     }
 
     // --- User Deposit/Withdraw Functions ---
-
-    /**
-     * @notice Deposits SRT into the vault, adding to the user's free stake.
-     * @param amount The amount of SRT to deposit.
-     */
+    // ... (No changes to deposit/withdraw functions)
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         if (srtStake[msg.sender] == 0) {
@@ -112,11 +112,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit DepositedSRT(msg.sender, amount);
     }
 
-    /**
-     * @notice Withdraws free SRT from the vault.
-     * @dev Will fail if the user tries to withdraw more than their free `srtStake`.
-     * @param amount The amount of SRT to withdraw.
-     */
     function withdrawSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         require(srtStake[msg.sender] >= amount, "insufficient SRT");
@@ -125,10 +120,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit WithdrawnSRT(msg.sender, amount);
     }
 
-    /**
-     * @notice Deposits USDC into the vault, adding to the user's free stake.
-     * @param amount The amount of USDC to deposit.
-     */
     function depositUSDC(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         usdcStake[msg.sender] += amount;
@@ -136,11 +127,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit DepositedUSDC(msg.sender, amount);
     }
 
-    /**
-     * @notice Withdraws free USDC from the vault.
-     * @dev Will fail if the user tries to withdraw more than their free `usdcStake`.
-     * @param amount The amount of USDC to withdraw.
-     */
     function withdrawUSDC(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
         require(usdcStake[msg.sender] >= amount, "insufficient USDC");
@@ -149,12 +135,9 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit WithdrawnUSDC(msg.sender, amount);
     }
 
-    // --- Settlement Contract Functions ---
 
-    /**
-     * @notice Moves SRT from a user's free stake to their locked stake.
-     * @dev Can only be called by the authorized settlement contract.
-     */
+    // --- Settlement Contract Functions ---
+    // ... (No changes to lock/release/slash logic, only the modifier is affected)
     function lockSRT(
         address user,
         uint256 amount
@@ -166,10 +149,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit LockedSRT(user, amount);
     }
 
-    /**
-     * @notice Moves SRT from a user's locked stake back to their free stake.
-     * @dev Can only be called by the authorized settlement contract.
-     */
     function releaseSRT(
         address user,
         uint256 amount
@@ -181,10 +160,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit ReleasedSRT(user, amount);
     }
 
-    /**
-     * @notice Removes SRT from a user's locked stake and sends it to a recipient.
-     * @dev Can only be called by the authorized settlement contract.
-     */
     function slashSRT(
         address user,
         uint256 amount,
@@ -198,10 +173,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit SlashedSRT(user, recipient, amount);
     }
 
-    /**
-     * @notice Moves USDC from a user's free stake to their locked stake.
-     * @dev Can only be called by the authorized settlement contract.
-     */
     function lockUSDC(
         address user,
         uint256 amount
@@ -213,10 +184,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit LockedUSDC(user, amount);
     }
 
-    /**
-     * @notice Moves USDC from a user's locked stake back to their free stake.
-     * @dev Can only be called by the authorized settlement contract.
-     */
     function releaseUSDC(
         address user,
         uint256 amount
@@ -228,10 +195,6 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         emit ReleasedUSDC(user, amount);
     }
 
-    /**
-     * @notice Removes USDC from a user's locked stake and sends it to a recipient.
-     * @dev Can only be called by the authorized settlement contract.
-     */
     function slashUSDC(
         address user,
         uint256 amount,
@@ -246,45 +209,27 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     }
 
     // --- View Functions ---
-
-    /**
-     * @notice Returns a user's free SRT balance.
-     */
+    // ... (No changes to view functions)
     function srtFreeOf(address user) external view returns (uint256) {
         return srtStake[user];
     }
 
-    /**
-     * @notice Returns a user's locked SRT balance.
-     */
     function srtLockedOf(address user) external view returns (uint256) {
         return srtLocked[user];
     }
 
-    /**
-     * @notice Returns a user's total (free + locked) SRT balance.
-     */
     function srtTotalOf(address user) external view returns (uint256) {
         return srtStake[user] + srtLocked[user];
     }
 
-    /**
-     * @notice Returns a user's free USDC balance.
-     */
     function usdcFreeOf(address user) external view returns (uint256) {
         return usdcStake[user];
     }
 
-    /**
-     * @notice Returns a user's locked USDC balance.
-     */
     function usdcLockedOf(address user) external view returns (uint256) {
         return usdcLocked[user];
     }
 
-    /**
-     * @notice Returns a user's total (free + locked) USDC balance.
-     */
     function usdcTotalOf(address user) external view returns (uint256) {
         return usdcStake[user] + usdcLocked[user];
     }

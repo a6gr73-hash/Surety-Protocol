@@ -60,5 +60,6 @@ interface ICollateralVault {
      * @param user The address of the user.
      * @return The amount of locked SRT.
      */
-    function srtLocked(address user) external view returns (uint256);
+    // MODIFIED: Corrected function name from srtLocked to srtLockedOf
+    function srtLockedOf(address user) external view returns (uint256);
 }
