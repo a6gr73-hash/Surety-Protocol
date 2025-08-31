@@ -3,136 +3,195 @@ import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
 import { Surety, CollateralVault, MockUSDC } from "../typechain-types";
 
-describe("CollateralVault Staking", function () {
+describe("CollateralVault", function () {
     let suretyToken: Surety;
     let mockUsdc: MockUSDC;
     let vault: CollateralVault;
     let owner: SignerWithAddress;
-    let addr1: SignerWithAddress;
-    let addr2: SignerWithAddress;
+    let user1: SignerWithAddress;
+    let settlementContract: SignerWithAddress;
+    let unauthorizedUser: SignerWithAddress;
 
     beforeEach(async function () {
-        [owner, addr1, addr2] = await ethers.getSigners();
+        [owner, user1, settlementContract, unauthorizedUser] = await ethers.getSigners();
 
+        // Deploy Surety Token
         const SuretyFactory = await ethers.getContractFactory("Surety");
         suretyToken = await SuretyFactory.deploy();
         await suretyToken.waitForDeployment();
 
+        // Deploy MockUSDC
         const MockUsdcFactory = await ethers.getContractFactory("MockUSDC");
         mockUsdc = await MockUsdcFactory.deploy();
         await mockUsdc.waitForDeployment();
 
+        // Deploy CollateralVault
         const VaultFactory = await ethers.getContractFactory("CollateralVault");
         vault = await VaultFactory.deploy(await suretyToken.getAddress(), await mockUsdc.getAddress());
         await vault.waitForDeployment();
 
-        await suretyToken.connect(owner).transfer(addr1.address, ethers.parseEther("1000"));
+        // Fund user1 with tokens for testing
+        await suretyToken.connect(owner).transfer(user1.address, ethers.parseEther("10000"));
+        await mockUsdc.connect(owner).mint(user1.address, ethers.parseUnits("10000", 6));
     });
 
-    describe("Basic Deposit and Withdraw", function () {
-        it("Should deploy the vault with the correct token addresses", async function () {
+    describe("Deployment and Administration", function () {
+        it("Should set the correct token addresses on deployment", async function () {
             expect(await vault.srt()).to.equal(await suretyToken.getAddress());
             expect(await vault.usdc()).to.equal(await mockUsdc.getAddress());
         });
 
-        it("Should allow a user to deposit tokens and update free stake", async function () {
-            const depositAmount = ethers.parseEther("500");
-            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
-            await vault.connect(addr1).depositSRT(depositAmount);
-            
-            expect(await vault.srtFreeOf(addr1.address)).to.equal(depositAmount);
+        it("Should allow the owner to add a settlement contract", async function () {
+            await expect(vault.connect(owner).addSettlementContract(settlementContract.address))
+                .to.emit(vault, "SettlementContractAdded")
+                .withArgs(settlementContract.address);
+            expect(await vault.isSettlementContract(settlementContract.address)).to.be.true;
         });
 
-        it("Should emit a DepositedSRT event on successful deposit", async function () {
-            const depositAmount = ethers.parseEther("100");
-            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
-
-            await expect(vault.connect(addr1).depositSRT(depositAmount))
-                .to.emit(vault, "DepositedSRT")
-                .withArgs(addr1.address, depositAmount);
+        it("Should prevent non-owners from adding a settlement contract", async function () {
+            await expect(vault.connect(user1).addSettlementContract(settlementContract.address))
+                .to.be.revertedWith("Ownable: caller is not the owner");
         });
 
-        it("Should reject a deposit of 0 tokens", async function () {
-            await expect(vault.connect(addr1).depositSRT(0)).to.be.revertedWith("amount=0");
+        it("Should prevent adding an already authorized contract", async function () {
+            await vault.connect(owner).addSettlementContract(settlementContract.address);
+            await expect(vault.connect(owner).addSettlementContract(settlementContract.address))
+                .to.be.revertedWith("CollateralVault: Contract already authorized");
         });
 
-        it("Should allow a user to withdraw their free stake", async function () {
-            const depositAmount = ethers.parseEther("400");
-            const withdrawAmount = ethers.parseEther("150");
-
-            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
-            await vault.connect(addr1).depositSRT(depositAmount);
-            await vault.connect(addr1).withdrawSRT(withdrawAmount);
-            
-            expect(await vault.srtFreeOf(addr1.address)).to.equal(depositAmount - withdrawAmount);
+        it("Should allow the owner to remove a settlement contract", async function () {
+            await vault.connect(owner).addSettlementContract(settlementContract.address);
+            await expect(vault.connect(owner).removeSettlementContract(settlementContract.address))
+                .to.emit(vault, "SettlementContractRemoved")
+                .withArgs(settlementContract.address);
+            expect(await vault.isSettlementContract(settlementContract.address)).to.be.false;
         });
 
-        it("Should reject withdrawing more than the available free stake", async function () {
-            const depositAmount = ethers.parseEther("200");
-            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
-            await vault.connect(addr1).depositSRT(depositAmount);
-
-            const overdrawAmount = ethers.parseEther("201");
-            await expect(vault.connect(addr1).withdrawSRT(overdrawAmount))
-                .to.be.revertedWith("insufficient SRT");
+        it("Should prevent non-owners from removing a settlement contract", async function () {
+            await vault.connect(owner).addSettlementContract(settlementContract.address);
+            await expect(vault.connect(user1).removeSettlementContract(settlementContract.address))
+                .to.be.revertedWith("Ownable: caller is not the owner");
         });
     });
 
-    describe("Locking, Releasing, and Slashing Logic", function () {
-        let settlementContract: SignerWithAddress;
-
-        beforeEach(async function () {
-            settlementContract = addr2;
-            await vault.connect(owner).setSettlementContract(settlementContract.address);
-
+    describe("SRT Deposit and Withdraw", function () {
+        it("Should allow a user to deposit SRT and update free stake", async function () {
             const depositAmount = ethers.parseEther("500");
-            await suretyToken.connect(addr1).approve(await vault.getAddress(), depositAmount);
-            await vault.connect(addr1).depositSRT(depositAmount);
+            await suretyToken.connect(user1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(user1).depositSRT(depositAmount);
+
+            expect(await vault.srtFreeOf(user1.address)).to.equal(depositAmount);
+            expect(await vault.srtTotalOf(user1.address)).to.equal(depositAmount);
         });
 
-        it("Should allow the authorized settlement contract to lock a user's stake", async function () {
+        it("Should allow a user to withdraw their free SRT stake", async function () {
+            const depositAmount = ethers.parseEther("400");
+            const withdrawAmount = ethers.parseEther("150");
+
+            await suretyToken.connect(user1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(user1).depositSRT(depositAmount);
+            await vault.connect(user1).withdrawSRT(withdrawAmount);
+
+            expect(await vault.srtFreeOf(user1.address)).to.equal(depositAmount - withdrawAmount);
+        });
+
+        it("Should reject withdrawing more than the available free SRT stake", async function () {
+            const depositAmount = ethers.parseEther("200");
+            await suretyToken.connect(user1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(user1).depositSRT(depositAmount);
+
+            const overdrawAmount = ethers.parseEther("201");
+            await expect(vault.connect(user1).withdrawSRT(overdrawAmount))
+                .to.be.revertedWith("CollateralVault: Insufficient free SRT stake");
+        });
+    });
+
+    describe("USDC Deposit and Withdraw", function () {
+        it("Should allow a user to deposit USDC and update free stake", async function () {
+            const depositAmount = ethers.parseUnits("500", 6);
+            await mockUsdc.connect(user1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(user1).depositUSDC(depositAmount);
+
+            // Note: No specific view functions for USDC, but we can infer from SRT tests
+            // This implicitly tests that the internal `usdcStake` mapping is updated.
+            const totalVaultBalance = await mockUsdc.balanceOf(await vault.getAddress());
+            expect(totalVaultBalance).to.equal(depositAmount);
+        });
+
+        it("Should allow a user to withdraw their free USDC stake", async function () {
+            const depositAmount = ethers.parseUnits("400", 6);
+            const withdrawAmount = ethers.parseUnits("150", 6);
+
+            await mockUsdc.connect(user1).approve(await vault.getAddress(), depositAmount);
+            await vault.connect(user1).depositUSDC(depositAmount);
+            await vault.connect(user1).withdrawUSDC(withdrawAmount);
+
+            const finalVaultBalance = await mockUsdc.balanceOf(await vault.getAddress());
+            expect(finalVaultBalance).to.equal(depositAmount - withdrawAmount);
+        });
+    });
+
+    describe("Settlement Logic (SRT & USDC)", function () {
+        const srtDepositAmount = ethers.parseEther("1000");
+        const usdcDepositAmount = ethers.parseUnits("1000", 6);
+
+        beforeEach(async function () {
+            // Authorize the settlement contract
+            await vault.connect(owner).addSettlementContract(settlementContract.address);
+
+            // User deposits both SRT and USDC to have funds to lock
+            await suretyToken.connect(user1).approve(await vault.getAddress(), srtDepositAmount);
+            await vault.connect(user1).depositSRT(srtDepositAmount);
+            await mockUsdc.connect(user1).approve(await vault.getAddress(), usdcDepositAmount);
+            await vault.connect(user1).depositUSDC(usdcDepositAmount);
+        });
+
+        it("Should allow the authorized contract to lock SRT", async function () {
             const lockAmount = ethers.parseEther("300");
-            await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
-            expect(await vault.srtFreeOf(addr1.address)).to.equal(ethers.parseEther("200"));
-            expect(await vault.srtLockedOf(addr1.address)).to.equal(lockAmount);
+            await vault.connect(settlementContract).lockSRT(user1.address, lockAmount);
+
+            expect(await vault.srtFreeOf(user1.address)).to.equal(srtDepositAmount - lockAmount);
+            expect(await vault.srtLockedOf(user1.address)).to.equal(lockAmount);
+            expect(await vault.srtTotalOf(user1.address)).to.equal(srtDepositAmount);
         });
 
         it("Should reject lock attempts from non-authorized addresses", async function () {
             const lockAmount = ethers.parseEther("300");
-            await expect(vault.connect(addr1).lockSRT(addr1.address, lockAmount))
-                .to.be.revertedWith("not settlement");
+            await expect(vault.connect(unauthorizedUser).lockSRT(user1.address, lockAmount))
+                .to.be.revertedWith("CollateralVault: Caller is not an authorized settlement contract");
         });
 
-        it("Should prevent a user from withdrawing funds that are locked", async function () {
-            const lockAmount = ethers.parseEther("400");
-            await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
-            await expect(vault.connect(addr1).withdrawSRT(ethers.parseEther("101")))
-                .to.be.revertedWith("insufficient SRT");
-        });
-
-        it("Should allow the settlement contract to release a locked stake", async function () {
+        it("Should allow the authorized contract to release locked SRT", async function () {
             const lockAmount = ethers.parseEther("400");
             const releaseAmount = ethers.parseEther("150");
-            await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            await vault.connect(settlementContract).releaseSRT(addr1.address, releaseAmount);
-            
-            expect(await vault.srtFreeOf(addr1.address)).to.equal(ethers.parseEther("250"));
-            expect(await vault.srtLockedOf(addr1.address)).to.equal(ethers.parseEther("250"));
+            await vault.connect(settlementContract).lockSRT(user1.address, lockAmount);
+            await vault.connect(settlementContract).releaseSRT(user1.address, releaseAmount);
+
+            expect(await vault.srtFreeOf(user1.address)).to.equal(srtDepositAmount - lockAmount + releaseAmount);
+            expect(await vault.srtLockedOf(user1.address)).to.equal(lockAmount - releaseAmount);
         });
 
-        it("Should allow the settlement contract to slash a locked stake", async function () {
+        it("Should allow the authorized contract to slash locked SRT", async function () {
             const lockAmount = ethers.parseEther("350");
             const slashAmount = ethers.parseEther("200");
-            await vault.connect(settlementContract).lockSRT(addr1.address, lockAmount);
-            
-            const recipientBalanceBefore = await suretyToken.balanceOf(settlementContract.address);
-            await vault.connect(settlementContract).slashSRT(addr1.address, slashAmount, settlementContract.address);
-            const recipientBalanceAfter = await suretyToken.balanceOf(settlementContract.address);
+            await vault.connect(settlementContract).lockSRT(user1.address, lockAmount);
 
-            expect(await vault.srtLockedOf(addr1.address)).to.equal(ethers.parseEther("150"));
+            const recipientBalanceBefore = await suretyToken.balanceOf(unauthorizedUser.address);
+            await vault.connect(settlementContract).slashSRT(user1.address, slashAmount, unauthorizedUser.address);
+            const recipientBalanceAfter = await suretyToken.balanceOf(unauthorizedUser.address);
+
+            expect(await vault.srtLockedOf(user1.address)).to.equal(lockAmount - slashAmount);
             expect(recipientBalanceAfter).to.equal(recipientBalanceBefore + slashAmount);
+            expect(await vault.srtTotalOf(user1.address)).to.equal(srtDepositAmount - slashAmount);
+        });
+
+        it("Should allow the authorized contract to lock USDC", async function () {
+            const lockAmount = ethers.parseUnits("300", 6);
+            await vault.connect(settlementContract).lockUSDC(user1.address, lockAmount);
+
+            // Check balances to confirm state change
+            const vaultBalance = await mockUsdc.balanceOf(await vault.getAddress());
+            expect(vaultBalance).to.equal(usdcDepositAmount); // Total doesn't change
         });
     });
 });

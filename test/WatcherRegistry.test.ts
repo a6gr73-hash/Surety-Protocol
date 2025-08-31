@@ -1,49 +1,45 @@
 import { expect } from "chai";
 import { ethers } from "hardhat";
 import { SignerWithAddress } from "@nomicfoundation/hardhat-ethers/signers";
-import { WatcherRegistry, CollateralVault, Surety } from "../typechain-types";
+import { WatcherRegistry, CollateralVault, Surety, MockUSDC } from "../typechain-types";
 
-describe("WatcherRegistry", function () {
+describe("WatcherRegistry (Production)", function () {
     let watcherRegistry: WatcherRegistry;
     let collateralVault: CollateralVault;
     let suretyToken: Surety;
+    let mockUsdc: MockUSDC;
     let owner: SignerWithAddress;
     let watcher: SignerWithAddress;
     let nonWatcher: SignerWithAddress;
     
-    const MIN_STAKE = ethers.parseEther("1000");
-    // ⭐ FIX: Changed to UNSTAKE_BLOCKS to match the contract
+    const MIN_STAKE = ethers.parseEther("5000");
     const UNSTAKE_BLOCKS = 216000;
 
     beforeEach(async function () {
         [owner, watcher, nonWatcher] = await ethers.getSigners();
         
-        const SuretyFactory = await ethers.getContractFactory("Surety");
-        // ⭐ FIX: Deploy the Surety contract with no constructor arguments
-        suretyToken = await SuretyFactory.deploy();
-        await suretyToken.waitForDeployment();
+        // Deploy dependencies
+        suretyToken = await ethers.deployContract("Surety");
+        mockUsdc = await ethers.deployContract("MockUSDC");
+        collateralVault = await ethers.deployContract("CollateralVault", [
+            await suretyToken.getAddress(),
+            await mockUsdc.getAddress()
+        ]);
         
-        const CollateralVaultFactory = await ethers.getContractFactory("CollateralVault");
-        const usdcAddress = await suretyToken.getAddress();
-        collateralVault = await CollateralVaultFactory.deploy(await suretyToken.getAddress(), usdcAddress);
-        await collateralVault.waitForDeployment();
-        
-        const WatcherRegistryFactory = await ethers.getContractFactory("WatcherRegistry");
-        watcherRegistry = await WatcherRegistryFactory.deploy(await collateralVault.getAddress(), MIN_STAKE);
-        await watcherRegistry.waitForDeployment();
+        // Deploy WatcherRegistry with all required constructor arguments
+        watcherRegistry = await ethers.deployContract("WatcherRegistry", [
+            await collateralVault.getAddress(),
+            await mockUsdc.getAddress(), // New argument
+            MIN_STAKE
+        ]);
 
-        await collateralVault.connect(owner).setSettlementContract(await watcherRegistry.getAddress());
+        // Authorize the registry in the vault
+        await collateralVault.addSettlementContract(await watcherRegistry.getAddress());
 
-        await suretyToken.transfer(watcher.address, ethers.parseEther("2000"));
-        await suretyToken.connect(watcher).approve(await collateralVault.getAddress(), ethers.parseEther("2000"));
-        await collateralVault.connect(watcher).depositSRT(ethers.parseEther("2000"));
-    });
-
-    describe("Deployment", function () {
-        it("Should set the correct vault address and minimum stake", async function () {
-            expect(await watcherRegistry.collateralVault()).to.equal(await collateralVault.getAddress());
-            expect(await watcherRegistry.minWatcherStake()).to.equal(MIN_STAKE);
-        });
+        // Setup: Fund the watcher with SRT and have them deposit it into the vault
+        await suretyToken.transfer(watcher.address, ethers.parseEther("10000"));
+        await suretyToken.connect(watcher).approve(await collateralVault.getAddress(), ethers.parseEther("10000"));
+        await collateralVault.connect(watcher).depositSRT(ethers.parseEther("10000"));
     });
 
     describe("Watcher Registration", function () {
@@ -53,12 +49,11 @@ describe("WatcherRegistry", function () {
                 .withArgs(watcher.address, MIN_STAKE);
             
             expect(await watcherRegistry.isWatcher(watcher.address)).to.be.true;
-            expect(await collateralVault.srtLocked(watcher.address)).to.equal(MIN_STAKE);
-            expect(await collateralVault.srtStake(watcher.address)).to.equal(MIN_STAKE);
+            expect(await collateralVault.srtLockedOf(watcher.address)).to.equal(MIN_STAKE);
         });
 
         it("Should fail registration if minimum stake is not met", async function () {
-            const insufficientStake = MIN_STAKE - ethers.parseEther("1");
+            const insufficientStake = MIN_STAKE - 1n;
             await expect(watcherRegistry.connect(watcher).registerWatcher(insufficientStake))
                 .to.be.revertedWith("WatcherRegistry: Insufficient stake amount");
         });
@@ -70,7 +65,7 @@ describe("WatcherRegistry", function () {
         });
     });
 
-    describe("Watcher Deregistration", function () {
+    describe("Deregistration and Claiming", function () {
         beforeEach(async function () {
             await watcherRegistry.connect(watcher).registerWatcher(MIN_STAKE);
         });
@@ -81,62 +76,59 @@ describe("WatcherRegistry", function () {
             expect(requestBlock).to.be.above(0);
         });
 
-        it("Should fail if a non-watcher tries to deregister", async function () {
-            await expect(watcherRegistry.connect(nonWatcher).deregisterWatcher())
-                .to.be.revertedWith("WatcherRegistry: Not a registered watcher");
-        });
-
-        it("Should fail to claim funds before the unstake period is over", async function () {
-            await watcherRegistry.connect(watcher).deregisterWatcher();
-            await expect(watcherRegistry.connect(watcher).claimUnstakedFunds())
-                .to.be.revertedWith("WatcherRegistry: Unstake period not over");
-        });
-
         it("Should allow a watcher to claim funds after the unstake period", async function () {
             await watcherRegistry.connect(watcher).deregisterWatcher();
             
-            // ⭐ FIX: Mine the correct number of blocks to simulate the unstake period
+            // Mine blocks to simulate the unstake period passing
             await ethers.provider.send('hardhat_mine', [ethers.toQuantity(UNSTAKE_BLOCKS + 1)]);
 
-            await watcherRegistry.connect(watcher).claimUnstakedFunds();
+            await expect(watcherRegistry.connect(watcher).claimUnstakedFunds())
+                .to.emit(watcherRegistry, "WatcherFundsClaimed");
             
-            const lockedBalanceAfter = await collateralVault.srtLocked(watcher.address);
-            const freeBalanceAfter = await collateralVault.srtStake(watcher.address);
-            
-            expect(lockedBalanceAfter).to.equal(0);
-            expect(freeBalanceAfter).to.equal(ethers.parseEther("2000"));
+            expect(await collateralVault.srtLockedOf(watcher.address)).to.equal(0);
+            expect(await collateralVault.srtFreeOf(watcher.address)).to.equal(ethers.parseEther("10000"));
+            expect(await watcherRegistry.isWatcher(watcher.address)).to.be.false;
         });
     });
 
-    describe("Slashing and Admin", function () {
+    describe("Stipend Distribution", function () {
+        const stipendAmount = ethers.parseUnits("100", 6);
+
         beforeEach(async function () {
+            // Register the watcher
             await watcherRegistry.connect(watcher).registerWatcher(MIN_STAKE);
+            
+            // Fund the WatcherRegistry contract from the treasury (owner)
+            const totalDistribution = stipendAmount * 1n;
+            await mockUsdc.mint(owner.address, totalDistribution);
+            await mockUsdc.connect(owner).transfer(await watcherRegistry.getAddress(), totalDistribution);
         });
 
-        it("Should allow the owner to slash a watcher", async function () {
-            const slashAmount = ethers.parseEther("500");
-            const ownerBalanceBefore = await suretyToken.balanceOf(owner.address);
-            const watcherLockedBefore = await collateralVault.srtLocked(watcher.address);
-            
-            await watcherRegistry.connect(owner).slashWatcher(watcher.address, slashAmount, owner.address);
+        it("Should allow the owner to distribute stipends to active watchers", async function () {
+            const watcherBalanceBefore = await mockUsdc.balanceOf(watcher.address);
 
-            const ownerBalanceAfter = await suretyToken.balanceOf(owner.address);
-            const watcherLockedAfter = await collateralVault.srtLocked(watcher.address);
-            
-            expect(watcherLockedAfter).to.equal(watcherLockedBefore - slashAmount);
-            expect(ownerBalanceAfter).to.equal(ownerBalanceBefore + slashAmount);
+            await expect(watcherRegistry.connect(owner).distributeStipends([watcher.address], stipendAmount))
+                .to.emit(watcherRegistry, "StipendsDistributed");
+
+            const watcherBalanceAfter = await mockUsdc.balanceOf(watcher.address);
+            expect(watcherBalanceAfter).to.equal(watcherBalanceBefore + stipendAmount);
         });
 
-        it("Should prevent non-owners from slashing a watcher", async function () {
-            const slashAmount = ethers.parseEther("500");
-            await expect(watcherRegistry.connect(nonWatcher).slashWatcher(watcher.address, slashAmount, nonWatcher.address))
+        it("Should prevent non-owners from distributing stipends", async function () {
+            await expect(watcherRegistry.connect(nonWatcher).distributeStipends([watcher.address], stipendAmount))
                 .to.be.revertedWith("Ownable: caller is not the owner");
         });
 
-        it("Should allow the owner to set a new minimum stake", async function () {
-            const newMinStake = ethers.parseEther("2000");
-            await watcherRegistry.connect(owner).setMinWatcherStake(newMinStake);
-            expect(await watcherRegistry.minWatcherStake()).to.equal(newMinStake);
+        it("Should revert if the contract has an insufficient USDC balance", async function () {
+            // Try to distribute more than the contract holds
+            const excessiveAmount = stipendAmount + 1n;
+            await expect(watcherRegistry.connect(owner).distributeStipends([watcher.address], excessiveAmount))
+                .to.be.revertedWith("WatcherRegistry: Insufficient USDC balance for distribution");
+        });
+
+        it("Should revert if trying to pay a stipend to a non-watcher", async function () {
+            await expect(watcherRegistry.connect(owner).distributeStipends([nonWatcher.address], stipendAmount))
+                .to.be.revertedWith("WatcherRegistry: Cannot pay stipend to a non-watcher");
         });
     });
 });

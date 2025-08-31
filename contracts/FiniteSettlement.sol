@@ -8,6 +8,12 @@ import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "./interfaces/ICollateralVault.sol";
 
+/**
+ * @title IPoIClaimProcessor
+ * @notice The interface for the Proof of Inclusion Claim Processor contract.
+ * @dev This interface defines the functions the FiniteSettlement contract needs to
+ * verify dispute resolutions and identify the watcher eligible for a reward.
+ */
 interface IPoIClaimProcessor {
     function isPayoutAuthorized(bytes32 paymentId) external view returns (bool);
 
@@ -16,9 +22,19 @@ interface IPoIClaimProcessor {
     ) external view returns (address);
 }
 
+/**
+ * @title FiniteSettlement
+ * @author FSP Architect
+ * @notice The core logic contract for the Finite Settlement Protocol.
+ * @dev This contract manages the lifecycle of a guaranteed payment. It handles
+ * payment initiation, collateral locking, execution, and a permissionless dispute resolution
+ * process for failed payments. It relies on a PoIClaimProcessor for proof
+ * verification and a CollateralVault for fund management.
+ */
 contract FiniteSettlement is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
+    // --- Enums ---
     enum Status {
         Pending,
         Resolved,
@@ -26,6 +42,17 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         Expired
     }
 
+    // --- Structs ---
+    /**
+     * @dev Stores all data for a payment's dispute lifecycle.
+     * @param payer The address initiating the payment and posting collateral.
+     * @param recipient The intended recipient of the payment.
+     * @param collateralToken The token used for collateral (SRT or USDC).
+     * @param paymentAmount The amount of USDC to be paid.
+     * @param collateralAmount The amount of collateral locked for the payment.
+     * @param escrowBlock The block number when a payment failed and was escrowed.
+     * @param status The current status of the payment/dispute.
+     */
     struct Dispute {
         address payer;
         address recipient;
@@ -36,18 +63,26 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         Status status;
     }
 
+    // --- State Variables ---
     mapping(bytes32 => Dispute) public disputes;
     ICollateralVault public immutable collateralVault;
     IPoIClaimProcessor public immutable poiProcessor;
     IERC20 public immutable usdc;
     IERC20 public immutable srt;
 
-    uint256 public constant DISPUTE_TIMEOUT_BLOCKS = 21600;
+    // --- Protocol Parameters ---
+    /// @notice The number of blocks after a payment fails before the payer can reclaim their collateral.
+    uint256 public constant DISPUTE_TIMEOUT_BLOCKS = 21600; // ~3 days on Arbitrum
+    /// @notice The collateral percentage required when using USDC (e.g., 110 = 110%).
     uint256 public immutable usdcCollateralPercent;
+    /// @notice The collateral percentage required when using SRT (e.g., 125 = 125%).
     uint256 public immutable srtCollateralPercent;
+    /// @notice The total fee taken during a dispute, as a percentage of the payment amount (e.g., 1 = 1%).
     uint256 public immutable protocolFeePercent;
+    /// @notice The percentage of the total protocol fee that is paid to the watcher as a Proof Reward (e.g., 20 = 20%).
     uint256 public immutable watcherRewardPercent;
 
+    // --- Events ---
     event PaymentInitiated(
         bytes32 indexed paymentId,
         address indexed payer,
@@ -56,7 +91,11 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
     );
     event PaymentExecuted(bytes32 indexed paymentId);
     event PaymentFailed(bytes32 indexed paymentId);
-    event DisputeResolved(bytes32 indexed paymentId, address indexed winner);
+    event DisputeResolved(
+        bytes32 indexed paymentId,
+        address indexed winner,
+        address indexed proofSubmitter
+    );
     event EscrowClaimed(bytes32 indexed paymentId, address indexed payer);
 
     constructor(
@@ -75,6 +114,15 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         watcherRewardPercent = 20;
     }
 
+    /**
+     * @notice Initiates a payment by locking collateral in the vault.
+     * @dev Creates a unique paymentId using a hash of inputs including `block.timestamp`.
+     * This use of timestamp is safe for uniqueness as it's not used for time-based logic.
+     * @param recipient The address that will receive the payment.
+     * @param amount The amount of USDC to be paid.
+     * @param useSrtCollateral If true, lock SRT as collateral; otherwise, lock USDC.
+     * @return paymentId The unique identifier for this payment.
+     */
     function initiatePayment(
         address recipient,
         uint256 amount,
@@ -85,7 +133,7 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         );
         require(
             disputes[paymentId].payer == address(0),
-            "FS: Payment ID exists"
+            "FiniteSettlement: Payment ID exists"
         );
 
         uint256 requiredCollateral;
@@ -116,9 +164,17 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         emit PaymentInitiated(paymentId, msg.sender, recipient, amount);
     }
 
+    /**
+     * @notice Executes a successful payment, transferring USDC and releasing collateral.
+     * @dev Follows the Checks-Effects-Interactions pattern to prevent re-entrancy.
+     * @param paymentId The ID of the payment to execute.
+     */
     function executePayment(bytes32 paymentId) external nonReentrant {
         Dispute storage dispute = disputes[paymentId];
-        require(dispute.status == Status.Pending, "FS: Not a pending payment");
+        require(
+            dispute.status == Status.Pending,
+            "FiniteSettlement: Not a pending payment"
+        );
         dispute.status = Status.Resolved;
         usdc.safeTransferFrom(
             dispute.payer,
@@ -138,9 +194,18 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         emit PaymentExecuted(paymentId);
     }
 
+    /**
+     * @notice Handles a payment that has failed, moving it to a dispute state.
+     * @dev This function slashes the payer's collateral and holds it in escrow within
+     * this contract to await a dispute resolution.
+     * @param paymentId The ID of the failed payment.
+     */
     function handlePaymentFailure(bytes32 paymentId) external nonReentrant {
         Dispute storage dispute = disputes[paymentId];
-        require(dispute.status == Status.Pending, "FS: Not a pending payment");
+        require(
+            dispute.status == Status.Pending,
+            "FiniteSettlement: Not a pending payment"
+        );
         dispute.status = Status.Failed;
         dispute.escrowBlock = block.number;
 
@@ -163,15 +228,20 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
 
     /**
      * @notice [PERMISSIONLESS] Resolves a failed dispute after a payout has been authorized.
-     * @dev The onlyOwner modifier has been removed to allow for an automated, permissionless system.
+     * @dev This function can be called by anyone (e.g., the watcher who submitted the proof)
+     * to trigger the final distribution of funds. It is protected by the isPayoutAuthorized check.
+     * It splits the protocol fee, rewarding the watcher and sending the rest to the treasury (owner).
+     * @param paymentId The ID of the dispute to resolve.
      */
     function resolveDispute(bytes32 paymentId) external nonReentrant {
-        // MODIFIED: `onlyOwner` modifier removed.
         Dispute storage dispute = disputes[paymentId];
-        require(dispute.status == Status.Failed, "FS: Dispute not failed");
+        require(
+            dispute.status == Status.Failed,
+            "FiniteSettlement: Dispute not failed"
+        );
         require(
             poiProcessor.isPayoutAuthorized(paymentId),
-            "FS: Payout not authorized by PoI"
+            "FiniteSettlement: Payout not authorized by PoI"
         );
 
         dispute.status = Status.Resolved;
@@ -179,7 +249,7 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         address proofSubmitter = poiProcessor.getProofSubmitter(paymentId);
         require(
             proofSubmitter != address(0),
-            "FS: Submitter cannot be zero address"
+            "FiniteSettlement: Submitter cannot be zero address"
         );
 
         uint256 totalFeeAmount = (dispute.paymentAmount * protocolFeePercent) /
@@ -198,16 +268,26 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
         token.safeTransfer(proofSubmitter, watcherPayout);
         token.safeTransfer(owner(), treasuryPayout);
 
-        emit DisputeResolved(paymentId, dispute.recipient);
+        emit DisputeResolved(paymentId, dispute.recipient, proofSubmitter);
     }
 
+    /**
+     * @notice Allows the payer to reclaim their full collateral if a dispute times out.
+     * @dev This is a backstop mechanism. If a payment fails and no valid proof is
+     * submitted within the `DISPUTE_TIMEOUT_BLOCKS` window, the original payer can
+     * retrieve their collateral.
+     * @param paymentId The ID of the expired dispute.
+     */
     function claimExpiredEscrow(bytes32 paymentId) external nonReentrant {
         Dispute storage dispute = disputes[paymentId];
-        require(dispute.payer == msg.sender, "FS: Not the payer");
-        require(dispute.status == Status.Failed, "FS: Dispute not failed");
+        require(dispute.payer == msg.sender, "FiniteSettlement: Not the payer");
+        require(
+            dispute.status == Status.Failed,
+            "FiniteSettlement: Dispute not failed"
+        );
         require(
             block.number >= dispute.escrowBlock + DISPUTE_TIMEOUT_BLOCKS,
-            "FS: Timeout not expired"
+            "FiniteSettlement: Timeout not expired"
         );
 
         dispute.status = Status.Expired;
