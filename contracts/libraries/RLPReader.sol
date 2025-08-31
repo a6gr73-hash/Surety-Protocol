@@ -1,3 +1,4 @@
+// contracts/libraries/RLPReader.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
@@ -7,114 +8,93 @@ library RLPReader {
         uint256 memPtr;
     }
 
+    function toRlpItem(bytes memory self) internal pure returns (RLPItem memory) {
+        uint256 memPtr;
+        assembly { memPtr := add(self, 0x20) }
+        return RLPItem(self.length, memPtr);
+    }
+
     function toBytes(RLPItem memory item) internal pure returns (bytes memory) {
         bytes memory b = new bytes(item.len);
         uint256 b_ptr;
-        assembly {
-            b_ptr := add(b, 0x20)
-        }
+        assembly { b_ptr := add(b, 0x20) }
         _copy(item.memPtr, b_ptr, item.len);
         return b;
     }
 
-    function toList(RLPItem memory item) internal pure returns (RLPItem[] memory) {
-        (uint256 payload_mem_ptr, uint256 payload_len) = _payload(item);
-        
-        RLPItem[] memory result = new RLPItem[](20);
-        uint256 items = 0;
-        uint256 curr_ptr = payload_mem_ptr;
-        while (curr_ptr < payload_mem_ptr + payload_len) {
-            uint256 item_len = _itemLength(curr_ptr);
-            if (items == result.length) {
-                // Resize array
-                RLPItem[] memory newResult = new RLPItem[](items * 2);
-                for(uint i=0; i < items; i++){
-                    newResult[i] = result[i];
-                }
-                result = newResult;
-            }
-            result[items] = RLPItem(item_len, curr_ptr);
-            items++;
-            curr_ptr += item_len;
-        }
-        
-        RLPItem[] memory trimmed_result = new RLPItem[](items);
-        for (uint256 i = 0; i < items; i++) {
-            trimmed_result[i] = result[i];
-        }
-        return trimmed_result;
+    // NEW FUNCTION: Decodes the payload of an RLP item, stripping the prefix.
+    function toData(RLPItem memory item) internal pure returns (bytes memory) {
+        (uint256 payloadPtr, uint256 payloadLen) = _payload(item);
+        bytes memory b = new bytes(payloadLen);
+        uint256 b_ptr;
+        assembly { b_ptr := add(b, 0x20) }
+        _copy(payloadPtr, b_ptr, payloadLen);
+        return b;
     }
-    
-    function toRlpItem(bytes memory self) internal pure returns (RLPItem memory) {
-        uint256 memPtr;
-        assembly {
-            memPtr := add(self, 0x20)
+
+    function toList(RLPItem memory item) internal pure returns (RLPItem[] memory) {
+        (uint256 payloadPtr, uint256 payloadLen) = _payload(item);
+        uint256 itemCount = 0;
+        uint256 tempPtr = payloadPtr;
+        while (tempPtr < payloadPtr + payloadLen) {
+            itemCount++;
+            tempPtr += _itemLength(tempPtr);
         }
-        return RLPItem(self.length, memPtr);
+        RLPItem[] memory result = new RLPItem[](itemCount);
+        uint256 currentPtr = payloadPtr;
+        for (uint256 i = 0; i < itemCount; i++) {
+            uint256 len = _itemLength(currentPtr);
+            result[i] = RLPItem(len, currentPtr);
+            currentPtr += len;
+        }
+        return result;
     }
 
     function _payload(RLPItem memory item) private pure returns (uint256, uint256) {
         uint256 ptr = item.memPtr;
         uint256 len = item.len;
-        uint8 first_byte;
-        assembly {
-            first_byte := byte(0, mload(ptr))
-        }
-
-        if (first_byte < 0x80) {
-            revert("RLPReader: invalid single-byte");
-        } else if (first_byte < 0xB8) {
-            return (ptr + 1, len - 1);
-        } else if (first_byte < 0xC0) {
-            uint8 len_len = first_byte - 0xB7;
-            return (ptr + 1 + len_len, len - 1 - len_len);
-        } else if (first_byte < 0xF8) {
-            return (ptr + 1, len - 1);
+        uint8 firstByte;
+        assembly { firstByte := byte(0, mload(ptr)) }
+        uint8 lenLen;
+        if (firstByte < 0xC0) {
+            if (firstByte < 0x80) return (ptr, len);
+            if (firstByte < 0xB8) return (ptr + 1, len - 1);
+            lenLen = firstByte - 0xB7;
+            return (ptr + 1 + lenLen, len - 1 - lenLen);
         } else {
-            uint8 len_len = first_byte - 0xF7;
-            return (ptr + 1 + len_len, len - 1 - len_len);
+            if (firstByte < 0xF8) return (ptr + 1, len - 1);
+            lenLen = firstByte - 0xF7;
+            return (ptr + 1 + lenLen, len - 1 - lenLen);
         }
     }
 
-    function _itemLength(uint256 mem_ptr) private pure returns (uint256) {
-        uint8 first_byte;
-        assembly {
-            first_byte := byte(0, mload(mem_ptr))
+    function _itemLength(uint256 memPtr) private pure returns (uint256) {
+        uint8 firstByte;
+        assembly { firstByte := byte(0, mload(memPtr)) }
+        uint8 lenLen;
+        if (firstByte < 0x80) return 1;
+        if (firstByte < 0xB8) return uint256(firstByte) - 0x80 + 1;
+        if (firstByte < 0xC0) {
+            lenLen = firstByte - 0xB7;
+            return _toUint(memPtr + 1, lenLen) + 1 + lenLen;
         }
-        if (first_byte < 0x80) {
-            return 1;
-        } else if (first_byte < 0xB8) {
-            return uint256(first_byte) - 0x80 + 1;
-        } else if (first_byte < 0xC0) {
-            uint8 len_len = first_byte - 0xB7;
-            uint256 len = _toUint(mem_ptr + 1, len_len);
-            return len + uint256(len_len) + 1;
-        } else if (first_byte < 0xF8) {
-            return uint256(first_byte) - 0xC0 + 1;
-        } else {
-            uint8 len_len = first_byte - 0xF7;
-            uint256 len = _toUint(mem_ptr + 1, len_len);
-            return len + uint256(len_len) + 1;
-        }
+        if (firstByte < 0xF8) return uint256(firstByte) - 0xC0 + 1;
+        lenLen = firstByte - 0xF7;
+        return _toUint(memPtr + 1, lenLen) + 1 + lenLen;
     }
     
-    function _toUint(uint256 memPtr, uint256 len) private pure returns (uint256) {
-        uint256 result = 0;
+    function _toUint(uint256 memPtr, uint256 len) private pure returns (uint256 result) {
         for (uint256 i = 0; i < len; i++) {
             uint8 b;
             uint256 p = memPtr + i;
             assembly { b := byte(0, mload(p)) }
             result = (result << 8) | b;
         }
-        return result;
     }
 
     function _copy(uint256 src, uint256 dest, uint256 len) private pure {
         for (uint256 i = 0; i < len; i += 32) {
-            assembly {
-                mstore(add(dest, i), mload(add(src, i)))
-            }
+            assembly { mstore(add(dest, i), mload(add(src, i))) }
         }
     }
 }
-

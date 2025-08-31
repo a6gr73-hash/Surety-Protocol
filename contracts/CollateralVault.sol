@@ -10,6 +10,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     IERC20 public immutable USDC;
 
     address public settlementContract;
+
     mapping(address => uint256) public srtStake;
     mapping(address => uint256) public srtLocked;
     mapping(address => uint256) public usdcStake;
@@ -50,7 +51,7 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         USDC = IERC20(_usdc);
     }
 
-    // --- Admin: set settlement contract ---
+    // --- Admin ---
     function setSettlementContract(address _settlement) external onlyOwner {
         require(_settlement != address(0), "settlement=0");
         settlementContract = _settlement;
@@ -60,10 +61,9 @@ contract CollateralVault is ReentrancyGuard, Ownable {
     // --- SRT functions ---
     function depositSRT(uint256 amount) external nonReentrant {
         require(amount > 0, "amount=0");
-        if (srtStake[msg.sender] == 0) {
+        if (srtStake[msg.sender] == 0 && srtLocked[msg.sender] == 0) {
             srtStakeTimestamp[msg.sender] = block.timestamp;
         }
-
         srtStake[msg.sender] += amount;
         require(
             SRT.transferFrom(msg.sender, address(this), amount),
@@ -169,44 +169,36 @@ contract CollateralVault is ReentrancyGuard, Ownable {
         emit SlashedUSDC(user, recipient, amount);
     }
 
-    // --- New functions for PoIClaimProcessor ---
-    function reimburseSlashedSRT(
+    // --- CORRECTED REIMBURSEMENT FUNCTIONS ---
+    function reimburseAndStakeSRT(
         address user,
         uint256 amount
-    ) external onlySettlement {
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(
+            SRT.transferFrom(msg.sender, address(this), amount),
+            "Reimbursement transfer failed"
+        );
         srtStake[user] += amount;
-        require(SRT.transfer(user, amount), "reimbursement failed");
-        emit ReleasedSRT(user, amount);
+        emit DepositedSRT(user, amount);
     }
 
-    function reimburseSlashedUSDC(
+    function reimburseAndStakeUSDC(
         address user,
         uint256 amount
-    ) external onlySettlement {
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(
+            USDC.transferFrom(msg.sender, address(this), amount),
+            "Reimbursement transfer failed"
+        );
         usdcStake[user] += amount;
-        require(USDC.transfer(user, amount), "reimbursement failed");
-        emit ReleasedUSDC(user, amount);
+        emit DepositedUSDC(user, amount);
     }
 
     // --- Views ---
-    function srtFreeOf(address user) external view returns (uint256) {
-        return srtStake[user];
-    }
-
-    function srtLockedOf(address user) external view returns (uint256) {
-        return srtLocked[user];
-    }
-
     function srtTotalOf(address user) external view returns (uint256) {
         return srtStake[user] + srtLocked[user];
-    }
-
-    function usdcFreeOf(address user) external view returns (uint256) {
-        return usdcStake[user];
-    }
-
-    function usdcLockedOf(address user) external view returns (uint256) {
-        return usdcLocked[user];
     }
 
     function usdcTotalOf(address user) external view returns (uint256) {

@@ -2,17 +2,22 @@ import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
 
 const config: HardhatUserConfig = {
-  solidity: "0.8.20",
-  paths: {
-    sources: "./contracts",
-    tests: "./test",
-    cache: "./cache",
-    artifacts: "./artifacts",
+  solidity: {
+    version: "0.8.20",
+    settings: {
+      optimizer: {
+        enabled: true,
+        runs: 200,
+      },
+      // ADD THIS LINE:
+      viaIR: true,
+    },
   },
-  typechain: {
-    outDir: "typechain-types",
-    target: "ethers-v6"
-  }
+  networks: {
+    hardhat: {
+      // Standard configuration for the local network.
+    },
+  },
 };
 
 export default config;

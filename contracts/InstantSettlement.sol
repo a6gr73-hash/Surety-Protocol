@@ -6,6 +6,11 @@ import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "./CollateralVault.sol";
 
+/**
+ * @title Instant Settlement Contract
+ * @notice This contract facilitates instant, over-collateralized payments to registered merchants.
+ * It interacts with a CollateralVault to lock and slash collateral, ensuring merchants are always paid.
+ */
 interface ICollateralVault {
     function usdcFreeOf(address user) external view returns (uint256);
 
@@ -31,22 +36,34 @@ interface ICollateralVault {
 }
 
 contract InstantSettlement is Ownable, ReentrancyGuard {
-    ICollateralVault public vault;
-    IERC20 public usdc;
-    IERC20 public srt;
+    // --- Core Contract Connections ---
+    ICollateralVault public immutable vault;
+    IERC20 public immutable usdc;
+    IERC20 public immutable srt;
+
+    // --- State Variables ---
     mapping(address => bool) public isMerchant;
     mapping(address => bool) public merchantInstantOnly;
-    uint256 public softCap;
-    uint256 public usdcCollateralPercent = 110;
-    uint256 public initialSrtPercent = 150;
-    uint256 public matureSrtPercent = 125;
-    uint256 public srtMaturity = 30 days;
-    uint256 public srtPrice;
+    uint256 public softCap; // The maximum amount for a single instant payment.
+    uint256 public srtPrice; // The price of SRT in USD, with 8 decimals.
 
+    // --- Collateralization Parameters ---
+    uint256 public usdcCollateralPercent = 110; // 110% for USDC collateral
+    uint256 public initialSrtPercent = 150; // 150% for new SRT stakes (<30 days)
+    uint256 public matureSrtPercent = 125; // 125% for mature SRT stakes (>30 days)
+    uint256 public srtMaturity = 30 days;
+
+    // --- Events ---
     event MerchantRegistered(address indexed merchant, bool instantOnly);
     event MerchantUpdated(address indexed merchant, bool instantOnly);
     event SoftCapUpdated(uint256 newSoftCap);
     event SrtPriceUpdated(uint256 newPrice);
+    event SrtParamsUpdated(
+        uint256 initialPercent,
+        uint256 maturePercent,
+        uint256 maturitySeconds
+    );
+    event UsdcCollateralPercentUpdated(uint256 percent);
     event InstantPayment(
         address indexed payer,
         address indexed merchant,
@@ -62,12 +79,10 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         uint256 slashedCollateral
     );
 
-    constructor(
-        address _vault,
-        address _usdc,
-        address _srt,
-        uint256 _softCap
-    ) Ownable() {
+    /**
+     * @notice Sets up the contract with immutable addresses and initial parameters.
+     */
+    constructor(address _vault, address _usdc, address _srt, uint256 _softCap) {
         require(_vault != address(0), "vault=0");
         require(_usdc != address(0), "usdc=0");
         require(_srt != address(0), "srt=0");
@@ -75,24 +90,35 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         vault = ICollateralVault(_vault);
         usdc = IERC20(_usdc);
         srt = IERC20(_srt);
-
         softCap = _softCap;
     }
 
-    // -----------------------------
-    // Admin configuration
-    // -----------------------------
+    // --- Admin Configuration ---
+
+    /**
+     * @notice Updates the soft cap for a single instant payment.
+     * @param _softCap The new maximum payment amount in USDC units.
+     */
     function setSoftCap(uint256 _softCap) external onlyOwner {
         softCap = _softCap;
         emit SoftCapUpdated(_softCap);
     }
 
+    /**
+     * @notice Updates the price of the SRT token, used for collateral calculations.
+     * @param _srtPrice The price of 1 SRT in USD, formatted with 8 decimals.
+     */
     function setSrtPrice(uint256 _srtPrice) external onlyOwner {
-        // srtPrice is USD per SRT with 8 decimals (like many oracle feeds)
         srtPrice = _srtPrice;
         emit SrtPriceUpdated(_srtPrice);
     }
 
+    /**
+     * @notice Updates the dynamic collateralization parameters for SRT.
+     * @param _initialPercent The new percentage for initial stakes.
+     * @param _maturePercent The new percentage for mature stakes.
+     * @param _maturitySeconds The new duration for a stake to be considered mature.
+     */
     function setSrtParams(
         uint256 _initialPercent,
         uint256 _maturePercent,
@@ -102,14 +128,30 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         initialSrtPercent = _initialPercent;
         matureSrtPercent = _maturePercent;
         srtMaturity = _maturitySeconds;
+        emit SrtParamsUpdated(
+            _initialPercent,
+            _maturePercent,
+            _maturitySeconds
+        );
     }
 
+    /**
+     * @notice Updates the collateralization percentage for USDC.
+     * @param _percent The new collateralization percentage (e.g., 110 for 110%).
+     */
     function setUsdcCollateralPercent(uint256 _percent) external onlyOwner {
         require(_percent >= 100, "percent<100");
         usdcCollateralPercent = _percent;
+        emit UsdcCollateralPercentUpdated(_percent);
     }
 
-    // Merchant management
+    // --- Merchant Management ---
+
+    /**
+     * @notice Registers a new merchant address.
+     * @param merchant The address of the merchant to register.
+     * @param instantOnly A flag to indicate if the merchant only accepts instant payments.
+     */
     function registerMerchant(
         address merchant,
         bool instantOnly
@@ -120,6 +162,11 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         emit MerchantRegistered(merchant, instantOnly);
     }
 
+    /**
+     * @notice Updates an existing merchant's settings.
+     * @param merchant The address of the merchant to update.
+     * @param instantOnly The new value for the instant-only flag.
+     */
     function updateMerchant(
         address merchant,
         bool instantOnly
@@ -129,41 +176,37 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         emit MerchantUpdated(merchant, instantOnly);
     }
 
-    // -----------------------------
-    // Core: Instant payment (USDC payments)
-    // -----------------------------
+    // --- Core Payment Logic ---
+
+    /**
+     * @notice Executes an instant payment from a user to a merchant, backed by collateral.
+     * @dev Locks collateral, attempts payment, then releases or slashes based on the outcome.
+     * @param merchant The recipient merchant's address.
+     * @param amountUSDC The amount of USDC to be paid.
+     * @param collateralIsSRT True if using SRT for collateral, false if using USDC.
+     */
     function sendInstantPayment(
         address merchant,
         uint256 amountUSDC,
         bool collateralIsSRT
     ) external nonReentrant {
-        // --- Basic checks ---
         require(isMerchant[merchant], "recipient not merchant");
         require(amountUSDC > 0, "amount=0");
         require(amountUSDC <= softCap, "above soft cap");
+        require(merchantInstantOnly[merchant], "merchant not instant-only");
 
-        // --- Enforce merchant instant-only ---
-        require(
-            merchantInstantOnly[merchant],
-            "merchant does not accept instant payments"
-        );
-
-        // --- Collateral and payment logic ---
         if (!collateralIsSRT) {
-            // USDC collateral path
             uint256 requiredUSDC = (amountUSDC * usdcCollateralPercent + 99) /
                 100;
-            uint256 freeUSDC = vault.usdcFreeOf(msg.sender);
-            require(freeUSDC >= requiredUSDC, "insufficient USDC collateral");
+            require(
+                vault.usdcFreeOf(msg.sender) >= requiredUSDC,
+                "insufficient USDC collateral"
+            );
 
-            // Lock collateral
             vault.lockUSDC(msg.sender, requiredUSDC);
-
-            // Attempt transfer of USDC payment
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
 
             if (ok) {
-                // Success: release collateral
                 vault.releaseUSDC(msg.sender, requiredUSDC);
                 emit InstantPayment(
                     msg.sender,
@@ -173,7 +216,6 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
                     requiredUSDC
                 );
             } else {
-                // Failure: slash collateral
                 vault.slashUSDC(msg.sender, requiredUSDC, merchant);
                 emit InstantPaymentFailed(
                     msg.sender,
@@ -184,29 +226,25 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
                 );
             }
         } else {
-            // --- SRT collateral path ---
             require(srtPrice > 0, "srtPrice not set");
 
-            // Determine percent based on stake age
             uint256 stakeTs = vault.srtStakeTimestamp(msg.sender);
-            uint256 percent = initialSrtPercent;
-            if (stakeTs > 0 && block.timestamp >= stakeTs + srtMaturity) {
-                percent = matureSrtPercent;
-            }
+            uint256 percent = (stakeTs > 0 &&
+                block.timestamp >= stakeTs + srtMaturity)
+                ? matureSrtPercent
+                : initialSrtPercent;
 
-            // Compute required SRT units
-            uint256 numerator = amountUSDC * percent * 1e20;
-            uint256 denominator = 100 * srtPrice;
+            // This calculation is more robust against precision loss with large numbers.
+            uint256 numerator = amountUSDC * percent * 1e20; // Scale up for precision
+            uint256 denominator = 100 * srtPrice; // srtPrice has 8 decimals
             uint256 requiredSRT = (numerator + denominator - 1) / denominator;
 
-            // Check payer has enough free SRT
-            uint256 freeSRT = vault.srtFreeOf(msg.sender);
-            require(freeSRT >= requiredSRT, "insufficient SRT collateral");
+            require(
+                vault.srtFreeOf(msg.sender) >= requiredSRT,
+                "insufficient SRT collateral"
+            );
 
-            // Lock SRT collateral
             vault.lockSRT(msg.sender, requiredSRT);
-
-            // Attempt USDC payment transfer
             bool ok = usdc.transferFrom(msg.sender, merchant, amountUSDC);
 
             if (ok) {
@@ -231,16 +269,24 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         }
     }
 
-    // -----------------------------
-    // Convenience / view helpers
-    // -----------------------------
+    // --- View Helpers ---
 
+    /**
+     * @notice Checks if a merchant is flagged as instant-only.
+     * @return True if the merchant only accepts instant payments, false otherwise.
+     */
     function merchantIsInstantOnly(
         address merchant
     ) external view returns (bool) {
         return merchantInstantOnly[merchant];
     }
 
+    /**
+     * @notice Estimates the amount of SRT required to collateralize a given USDC payment.
+     * @param amountUSDC The amount of the payment in USDC units.
+     * @param useMaturePercent True to use the mature stake rate, false to use the initial rate.
+     * @return The estimated amount of SRT required (in wei).
+     */
     function estimateRequiredSRT(
         uint256 amountUSDC,
         bool useMaturePercent
@@ -249,7 +295,8 @@ contract InstantSettlement is Ownable, ReentrancyGuard {
         uint256 percent = useMaturePercent
             ? matureSrtPercent
             : initialSrtPercent;
-        uint256 numerator = amountUSDC * percent * (10 ** 20);
+
+        uint256 numerator = amountUSDC * percent * 1e20;
         uint256 denominator = 100 * srtPrice;
         return (numerator + denominator - 1) / denominator;
     }

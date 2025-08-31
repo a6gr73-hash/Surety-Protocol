@@ -5,14 +5,17 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "./libraries/MerklePatriciaTrie.sol";
 
 interface ICollateralVault {
-    function reimburseSlashedSRT(address user, uint256 amount) external;
-
-    function reimburseSlashedUSDC(address user, uint256 amount) external;
+    function reimburseAndStakeSRT(address user, uint256 amount) external;
+    function reimburseAndStakeUSDC(address user, uint256 amount) external;
 }
 
 contract PoIClaimProcessor is Ownable {
-    address public collateralVault;
+    // --- State Variables ---
+    ICollateralVault public immutable vault;
+    address public immutable SRT;
+    address public immutable USDC;
 
+    // --- Structs ---
     struct PoIClaim {
         address payer;
         address merchant;
@@ -29,6 +32,7 @@ contract PoIClaimProcessor is Ownable {
         address relayer;
     }
 
+    // --- Mappings and Events ---
     mapping(address => uint256) public nextNonce;
     mapping(bytes32 => PoIClaim) public claims;
     mapping(bytes32 => bool) public isShardRootPublished;
@@ -37,70 +41,75 @@ contract PoIClaimProcessor is Ownable {
     event PoIClaimVerified(bytes32 claimId, uint256 reimbursedAmount);
     event PoIClaimRejected(bytes32 claimId);
     event PoIClaimReimbursed(bytes32 claimId, uint256 reimbursedAmount);
-    event RelayerReimbursed(address indexed relayer, uint256 amount);
 
-    constructor(address _collateralVault) Ownable() {
-        require(_collateralVault != address(0), "vault=0");
-        collateralVault = _collateralVault;
+    // --- Constructor ---
+    constructor(address _vault, address _srt, address _usdc) {
+        require(_vault != address(0), "vault=0");
+        require(_srt != address(0), "srt=0");
+        require(_usdc != address(0), "usdc=0");
+        vault = ICollateralVault(_vault);
+        SRT = _srt;
+        USDC = _usdc;
     }
 
-    function submitPoIClaim(
-        bytes calldata claimData,
-        bytes memory signature
-    ) external {
-        PoIClaim memory newClaim = abi.decode(claimData, (PoIClaim));
-        require(newClaim.nonce == nextNonce[newClaim.payer], "Invalid nonce");
+    // --- Core Functions ---
 
+    /**
+     * @notice Submits a Proof of Innocence claim for a failed transaction.
+     * @param claim The PoIClaim struct containing all claim data.
+     * @param signature The user's signature over the hash of the encoded claim data.
+     */
+    function submitPoIClaim(PoIClaim calldata claim, bytes memory signature) external {
+        require(claim.nonce == nextNonce[claim.payer], "Invalid nonce");
+
+        // Re-encode the received struct to verify the hash that the user signed.
+        bytes memory claimData = abi.encode(
+            claim.payer, claim.merchant, claim.collateralToken, claim.slashedAmount,
+            claim.timestamp, claim.nonce, claim.slashedProof, claim.nonArrivalProof,
+            claim.sourceShardRoot, claim.targetShardRoot, claim.isVerified,
+            claim.isReimbursed, claim.relayer
+        );
         bytes32 claimHash = keccak256(claimData);
-        bytes32 messageHash = keccak256(
-            abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash)
-        );
-
+        bytes32 messageHash = keccak256(abi.encodePacked("\x19Ethereum Signed Message:\n32", claimHash));
+        
         address signer = recoverSigner(messageHash, signature);
-        require(signer == newClaim.payer, "Invalid signature or payer address");
-        require(
-            claims[claimHash].payer == address(0),
-            "Claim already submitted"
-        );
+        require(signer == claim.payer && signer != address(0), "Invalid signature");
+        require(claims[claimHash].payer == address(0), "Claim already submitted");
+        
+        claims[claimHash] = claim;
+        // The relayer is the actual transaction sender.
+        claims[claimHash].relayer = msg.sender;
 
-        newClaim.relayer = msg.sender;
-        claims[claimHash] = newClaim;
-        nextNonce[newClaim.payer]++;
-
-        emit PoIClaimSubmitted(newClaim.payer, claimHash);
+        nextNonce[claim.payer]++;
+        emit PoIClaimSubmitted(claim.payer, claimHash);
     }
 
+    /**
+     * @notice Verifies the Merkle proofs for a submitted claim. Can only be called by the owner.
+     * @param claimId The unique hash of the claim to verify.
+     */
     function verifyPoIClaim(bytes32 claimId) external onlyOwner {
         PoIClaim storage claim = claims[claimId];
         require(claim.payer != address(0), "Claim does not exist");
         require(!claim.isVerified, "Claim already verified");
+        require(isShardRootPublished[claim.sourceShardRoot], "Source root not published");
+        require(isShardRootPublished[claim.targetShardRoot], "Target root not published");
+        require(claim.slashedProof.length > 0, "Slashed proof missing");
 
-        require(
-            isShardRootPublished[claim.sourceShardRoot],
-            "Source shard root not published"
-        );
-        require(
-            isShardRootPublished[claim.targetShardRoot],
-            "Target shard root not published"
-        );
-
-        // The key for the proof is the hash of the transaction data itself.
-        bytes32 slashedTxHash = keccak256(claim.slashedProof[0]);
-
-        // --- THIS IS THE CORRECTED LOGIC ---
-        // Explicitly convert the bytes32 key to bytes memory
-        bytes memory txHashAsBytes = abi.encodePacked(slashedTxHash);
+        bytes memory txData = claim.slashedProof[0];
+        bytes32 txHash = keccak256(txData);
 
         bool isProofOfDepartureValid = MerklePatriciaTrie.verifyInclusion(
             claim.slashedProof,
             claim.sourceShardRoot,
-            txHashAsBytes,
-            claim.slashedProof[0]
+            abi.encodePacked(txHash),
+            txData
         );
+        
         bytes memory nonArrivalValue = MerklePatriciaTrie.get(
             claim.nonArrivalProof,
             claim.targetShardRoot,
-            txHashAsBytes
+            abi.encodePacked(txHash)
         );
         bool isProofOfNonArrivalValid = nonArrivalValue.length == 0;
 
@@ -112,36 +121,41 @@ contract PoIClaimProcessor is Ownable {
         }
     }
 
+    /**
+     * @notice Publishes a shard's state root to this contract. Can only be called by the owner.
+     * @param root The state root to publish.
+     */
     function publishShardRoot(bytes32 root) external onlyOwner {
         isShardRootPublished[root] = true;
     }
 
+    /**
+     * @notice Reimburses a user for a verified claim. Can only be called by the owner.
+     * @param claimId The unique hash of the claim to reimburse.
+     */
     function reimburseSlashedFunds(bytes32 claimId) external onlyOwner {
         PoIClaim storage claim = claims[claimId];
         require(claim.isVerified, "Claim not verified");
         require(!claim.isReimbursed, "Claim already reimbursed");
 
-        if (claim.collateralToken == address(0)) {
-            // Assuming SRT is address(0) sentinel
-            ICollateralVault(collateralVault).reimburseSlashedSRT(
-                claim.payer,
-                claim.slashedAmount
-            );
-        } else {
-            ICollateralVault(collateralVault).reimburseSlashedUSDC(
-                claim.payer,
-                claim.slashedAmount
-            );
-        }
-
         claim.isReimbursed = true;
+        
+        if (claim.collateralToken == SRT) {
+            vault.reimburseAndStakeSRT(claim.payer, claim.slashedAmount);
+        } else if (claim.collateralToken == USDC) {
+            vault.reimburseAndStakeUSDC(claim.payer, claim.slashedAmount);
+        } else {
+            revert("Unsupported collateral token");
+        }
+        
         emit PoIClaimReimbursed(claimId, claim.slashedAmount);
     }
-
-    function recoverSigner(
-        bytes32 _messageHash,
-        bytes memory _signature
-    ) internal pure returns (address) {
+    
+    /**
+     * @dev Recovers the signer's address from a message hash and signature.
+     */
+    function recoverSigner(bytes32 _messageHash, bytes memory _signature) internal pure returns (address) {
+        require(_signature.length == 65, "Invalid signature length");
         bytes32 r;
         bytes32 s;
         uint8 v;
@@ -150,9 +164,7 @@ contract PoIClaimProcessor is Ownable {
             s := mload(add(_signature, 64))
             v := byte(0, mload(add(_signature, 96)))
         }
-        if (v < 27) {
-            v += 27;
-        }
+        if (v < 27) v += 27;
         return ecrecover(_messageHash, v, r, s);
     }
 }

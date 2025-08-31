@@ -1,122 +1,151 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
+import "@openzeppelin/contracts/utils/cryptography/MerkleProof.sol";
 import "./RLPReader.sol";
 
 library MerklePatriciaTrie {
     using RLPReader for RLPReader.RLPItem;
     using RLPReader for bytes;
 
-    function get(bytes[] memory proof, bytes32 root, bytes memory key) internal pure returns (bytes memory) {
-        RLPReader.RLPItem memory item;
+    /**
+     * @dev Returns the value of a key in a Merkle Patricia Trie using a proof.
+     * @param proof Array of RLP-encoded nodes leading from root to the key.
+     * @param root Root hash of the trie.
+     * @param key The key to look up.
+     */
+    function get(
+        bytes[] memory proof,
+        bytes32 root,
+        bytes memory key
+    ) internal pure returns (bytes memory value) {
+        // name the return variable
         bytes memory path = _getNibbleKey(key);
-        uint256 proof_idx = 0;
-        
-        bytes memory first_node_bytes = proof[proof_idx];
-        RLPReader.RLPItem[] memory node = first_node_bytes.toRlpItem().toList();
-        
-        bytes32 node_hash = keccak256(first_node_bytes);
-        require(node_hash == root, "MerklePatriciaTrie: invalid root");
-        
-        while (true) {
-            require(proof_idx < proof.length, "MerklePatriciaTrie: proof is too short");
-            if (path.length == 0) {
-                if (node.length == 17) return node[16].toBytes();
-                return "";
-            }
-            
-            if (node.length == 2) {
-                bytes memory node_path = _decodeNodePath(node[0].toBytes());
-                if (_pathStartsWith(path, node_path)) {
-                    path = _pathSlice(path, node_path.length);
-                    if (_isLeafNode(node[0].toBytes())) {
-                        if (path.length == 0) return node[1].toBytes();
+        uint256 proofIdx = 0;
+
+        if (proof.length == 0) {
+            return ""; // explicitly return empty bytes
+        }
+
+        bytes memory currentNodeBytes = proof[proofIdx++];
+        require(keccak256(currentNodeBytes) == root, "MPT: Invalid root");
+        RLPReader.RLPItem[] memory currentNode = currentNodeBytes
+            .toRlpItem()
+            .toList();
+
+        while (path.length > 0) {
+            if (proofIdx > proof.length) return "";
+
+            if (currentNode.length == 17) {
+                uint8 nibble = uint8(path[0]);
+                path = _pathSlice(path, 1);
+                RLPReader.RLPItem memory child = currentNode[nibble];
+                if (child.len == 0) return "";
+
+                bytes memory childBytes = child.toBytes();
+                if (child.len < 32) {
+                    currentNodeBytes = childBytes;
+                    currentNode = currentNodeBytes.toRlpItem().toList();
+                } else {
+                    bytes32 nodeHash = bytes32(childBytes);
+                    require(proofIdx < proof.length, "MPT: Proof too short");
+                    currentNodeBytes = proof[proofIdx++];
+                    require(
+                        keccak256(currentNodeBytes) == nodeHash,
+                        "MPT: Invalid proof"
+                    );
+                    currentNode = currentNodeBytes.toRlpItem().toList();
+                }
+            } else if (currentNode.length == 2) {
+                bytes memory nodePath = _decodeNodePath(
+                    currentNode[0].toBytes()
+                );
+                if (_pathStartsWith(path, nodePath)) {
+                    path = _pathSlice(path, nodePath.length);
+                    if (_isLeafNode(currentNode[0].toBytes())) {
+                        if (path.length == 0) return currentNode[1].toBytes();
                         return "";
+                    } else {
+                        bytes32 nodeHash = bytes32(currentNode[1].toBytes());
+                        require(
+                            proofIdx < proof.length,
+                            "MPT: Proof too short"
+                        );
+                        currentNodeBytes = proof[proofIdx++];
+                        require(
+                            keccak256(currentNodeBytes) == nodeHash,
+                            "MPT: Invalid proof"
+                        );
+                        currentNode = currentNodeBytes.toRlpItem().toList();
                     }
-                    item = node[1];
-                    node_hash = bytes32(item.toBytes());
                 } else {
                     return "";
                 }
-            } else if (node.length == 17) {
-                uint8 nibble = uint8(path[0]);
-                path = _pathSlice(path, 1);
-                item = node[nibble];
-                if (item.len == 0) return "";
-                
-                bytes memory item_bytes = item.toBytes();
-                if (item.len >= 32) {
-                    node_hash = bytes32(item_bytes);
-                } else {
-                    node_hash = keccak256(item_bytes);
-                }
             } else {
-                return "";
+                revert("MPT: Invalid node");
             }
-            
-            proof_idx++;
-            node = proof[proof_idx].toRlpItem().toList();
-            require(keccak256(proof[proof_idx]) == node_hash, "MerklePatriciaTrie: invalid proof");
         }
-        
-        revert("MerklePatriciaTrie: Should not be reached");
+
+        if (currentNode.length == 17) {
+            value = currentNode[16].toBytes();
+        } else {
+            value = "";
+        }
     }
 
-    function verifyInclusion(bytes[] memory proof, bytes32 root, bytes memory key, bytes memory value) internal pure returns (bool) {
-        bytes memory result = get(proof, root, key);
-        return keccak256(result) == keccak256(value);
+    /**
+     * @dev Verifies inclusion of a key/value pair in the trie.
+     */
+    function verifyInclusion(
+        bytes[] memory proof,
+        bytes32 root,
+        bytes memory key,
+        bytes memory value
+    ) internal pure returns (bool) {
+        return keccak256(get(proof, root, key)) == keccak256(value);
     }
 
-    function _getNibbleKey(bytes memory key) private pure returns (bytes memory) {
+    function _getNibbleKey(
+        bytes memory key
+    ) private pure returns (bytes memory) {
         bytes memory nibbles = new bytes(key.length * 2);
         for (uint256 i = 0; i < key.length; i++) {
             uint8 b = uint8(key[i]);
-            nibbles[i * 2] = bytes1(b / 16);
-            nibbles[i * 2 + 1] = bytes1(b % 16);
+            nibbles[i * 2] = bytes1(b >> 4);
+            nibbles[i * 2 + 1] = bytes1(b & 0x0F);
         }
         return nibbles;
     }
 
-    function _decodeNodePath(bytes memory data) private pure returns (bytes memory) {
-        uint256 path_len;
-        uint256 path_ptr;
-        if (uint8(data[0]) % 2 == 1) {
-            path_len = data.length * 2 - 1;
+    function _decodeNodePath(
+        bytes memory data
+    ) private pure returns (bytes memory path) {
+        uint8 prefix = uint8(data[0]);
+        if ((prefix & 0x10) == 0x10) {
+            // odd length flag
+            path = new bytes(data.length * 2 - 1);
+            path[0] = bytes1(prefix & 0x0F);
+            for (uint256 i = 1; i < data.length; i++) {
+                path[i * 2 - 1] = bytes1(uint8(data[i]) >> 4);
+                path[i * 2] = bytes1(uint8(data[i]) & 0x0F);
+            }
         } else {
-            path_len = data.length * 2 - 2;
-        }
-        bytes memory path = new bytes(path_len);
-        
-        assembly {
-            path_ptr := add(path, 0x20)
-        }
-        
-        if (uint8(data[0]) % 2 == 1) {
-            assembly {
-                mstore8(path_ptr, and(byte(0, mload(add(data, 0x20))), 0x0F))
+            path = new bytes(data.length * 2 - 2);
+            for (uint256 i = 1; i < data.length; i++) {
+                path[(i - 1) * 2] = bytes1(uint8(data[i]) >> 4);
+                path[(i - 1) * 2 + 1] = bytes1(uint8(data[i]) & 0x0F);
             }
-            path_ptr++;
         }
-        
-        for (uint256 i = 1; i < data.length; i++) {
-            uint8 b;
-            assembly {
-                b := byte(0, mload(add(data, add(0x20, i))))
-            }
-            assembly {
-                mstore8(path_ptr, div(b, 16))
-                mstore8(add(path_ptr, 1), and(b, 0x0F))
-            }
-            path_ptr += 2;
-        }
-        return path;
     }
 
     function _isLeafNode(bytes memory data) private pure returns (bool) {
-        return uint8(data[0]) >= 0x20;
+        return (uint8(data[0]) & 0x20) == 0x20;
     }
 
-    function _pathStartsWith(bytes memory path, bytes memory subpath) private pure returns (bool) {
+    function _pathStartsWith(
+        bytes memory path,
+        bytes memory subpath
+    ) private pure returns (bool) {
         if (path.length < subpath.length) return false;
         for (uint256 i = 0; i < subpath.length; i++) {
             if (path[i] != subpath[i]) return false;
@@ -124,7 +153,11 @@ library MerklePatriciaTrie {
         return true;
     }
 
-    function _pathSlice(bytes memory path, uint256 start) private pure returns (bytes memory) {
+    function _pathSlice(
+        bytes memory path,
+        uint256 start
+    ) private pure returns (bytes memory) {
+        if (start >= path.length) return new bytes(0);
         uint256 len = path.length - start;
         bytes memory subpath = new bytes(len);
         for (uint256 i = 0; i < len; i++) {

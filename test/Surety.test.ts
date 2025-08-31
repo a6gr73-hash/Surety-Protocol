@@ -12,12 +12,10 @@ describe("Surety Token", function () {
     beforeEach(async function () {
         [owner, addr1] = await ethers.getSigners();
 
-        // Define the initial supply, which is required by the constructor
         initialSupply = ethers.parseEther("1000000000"); // 1 Billion SRT
 
-        // Deploy the Surety contract with the initial supply as an argument
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        suretyToken = await SuretyFactory.deploy(initialSupply);
+        suretyToken = (await SuretyFactory.deploy(initialSupply)) as unknown as Surety;
         await suretyToken.waitForDeployment();
     });
 
@@ -38,17 +36,11 @@ describe("Surety Token", function () {
         const mintAmount = ethers.parseEther("500");
         const initialOwnerBalance = await suretyToken.balanceOf(owner.address);
 
-        // Mint new tokens to addr1
         await suretyToken.connect(owner).mint(addr1.address, mintAmount);
 
-        // Check addr1's new balance
         expect(await suretyToken.balanceOf(addr1.address)).to.equal(mintAmount);
-
-        // Check that total supply has increased
         const newTotalSupply = await suretyToken.totalSupply();
         expect(newTotalSupply).to.equal(initialSupply + mintAmount);
-
-        // Owner's balance should be unchanged
         expect(await suretyToken.balanceOf(owner.address)).to.equal(initialOwnerBalance);
     });
 
@@ -56,10 +48,8 @@ describe("Surety Token", function () {
         const burnAmount = ethers.parseEther("100");
         const initialOwnerBalance = await suretyToken.balanceOf(owner.address);
 
-        // Owner burns tokens from their own address
         await suretyToken.connect(owner).burn(owner.address, burnAmount);
 
-        // Check that owner's balance and total supply have decreased
         const expectedBalance = initialOwnerBalance - burnAmount;
         expect(await suretyToken.balanceOf(owner.address)).to.equal(expectedBalance);
         expect(await suretyToken.totalSupply()).to.equal(initialSupply - burnAmount);
@@ -68,11 +58,9 @@ describe("Surety Token", function () {
     it("Should not allow non-owners to mint or burn tokens", async function () {
         const amount = ethers.parseEther("100");
 
-        // addr1 attempts to mint
         await expect(suretyToken.connect(addr1).mint(addr1.address, amount))
             .to.be.revertedWith("Ownable: caller is not the owner");
 
-        // addr1 attempts to burn
         await expect(suretyToken.connect(addr1).burn(owner.address, amount))
             .to.be.revertedWith("Ownable: caller is not the owner");
     });
