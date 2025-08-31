@@ -12,10 +12,13 @@ describe("Surety Token", function () {
     beforeEach(async function () {
         [owner, addr1] = await ethers.getSigners();
 
+        // This value is still needed for the tests, it just isn't passed to the constructor.
         initialSupply = ethers.parseEther("1000000000"); // 1 Billion SRT
 
         const SuretyFactory = await ethers.getContractFactory("Surety");
-        suretyToken = (await SuretyFactory.deploy(initialSupply)) as unknown as Surety;
+        
+        // CORRECTED: The deploy function is called with no arguments.
+        suretyToken = (await SuretyFactory.deploy()) as unknown as Surety;
         await suretyToken.waitForDeployment();
     });
 
@@ -32,16 +35,10 @@ describe("Surety Token", function () {
         expect(ownerBalance).to.equal(initialSupply);
     });
 
-    it("Should allow the owner to mint additional tokens", async function () {
-        const mintAmount = ethers.parseEther("500");
-        const initialOwnerBalance = await suretyToken.balanceOf(owner.address);
-
-        await suretyToken.connect(owner).mint(addr1.address, mintAmount);
-
-        expect(await suretyToken.balanceOf(addr1.address)).to.equal(mintAmount);
-        const newTotalSupply = await suretyToken.totalSupply();
-        expect(newTotalSupply).to.equal(initialSupply + mintAmount);
-        expect(await suretyToken.balanceOf(owner.address)).to.equal(initialOwnerBalance);
+    it("Should not have a mint function for non-owners", async function () {
+        // This test confirms that the public mint function was removed as per the final contract.
+        // The 'any' type is used to check for the absence of the function at runtime.
+        expect((suretyToken.connect(addr1) as any).mint).to.be.undefined;
     });
 
     it("Should allow the owner to burn tokens from any address", async function () {
@@ -55,11 +52,8 @@ describe("Surety Token", function () {
         expect(await suretyToken.totalSupply()).to.equal(initialSupply - burnAmount);
     });
 
-    it("Should not allow non-owners to mint or burn tokens", async function () {
+    it("Should not allow non-owners to burn tokens", async function () {
         const amount = ethers.parseEther("100");
-
-        await expect(suretyToken.connect(addr1).mint(addr1.address, amount))
-            .to.be.revertedWith("Ownable: caller is not the owner");
 
         await expect(suretyToken.connect(addr1).burn(owner.address, amount))
             .to.be.revertedWith("Ownable: caller is not the owner");

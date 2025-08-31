@@ -243,7 +243,6 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
             poiProcessor.isPayoutAuthorized(paymentId),
             "FiniteSettlement: Payout not authorized by PoI"
         );
-
         dispute.status = Status.Resolved;
 
         address proofSubmitter = poiProcessor.getProofSubmitter(paymentId);
@@ -252,11 +251,18 @@ contract FiniteSettlement is Ownable, ReentrancyGuard {
             "FiniteSettlement: Submitter cannot be zero address"
         );
 
+        // --- DEFINITIVELY CORRECTED FEE CALCULATION LOGIC ---
+        // We calculate totalFeeAmount first, as it is needed for the payer refund logic.
         uint256 totalFeeAmount = (dispute.paymentAmount * protocolFeePercent) /
             100;
-        uint256 watcherPayout = (totalFeeAmount * watcherRewardPercent) / 100;
-        uint256 treasuryPayout = totalFeeAmount - watcherPayout;
 
+        // We calculate watcherPayout from the original amount to prevent chained division and precision loss.
+        // The divisor is 10000 because we are applying two percentage calculations (100 * 100).
+        uint256 watcherPayout = (dispute.paymentAmount *
+            protocolFeePercent *
+            watcherRewardPercent) / 10000;
+
+        uint256 treasuryPayout = totalFeeAmount - watcherPayout;
         uint256 recipientPayout = dispute.paymentAmount;
         uint256 payerRefund = dispute.collateralAmount -
             recipientPayout -
