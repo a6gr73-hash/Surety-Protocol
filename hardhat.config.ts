@@ -1,6 +1,5 @@
 import { HardhatUserConfig } from "hardhat/config";
 import "@nomicfoundation/hardhat-toolbox";
-import "./scripts/triggerEvent";
 
 const config: HardhatUserConfig = {
   solidity: {
@@ -10,21 +9,14 @@ const config: HardhatUserConfig = {
         enabled: true,
         runs: 200,
       },
+      // ADD THIS LINE:
       viaIR: true,
     },
   },
   networks: {
     hardhat: {
-      accounts: {
-        count: 60, // Provides 60 test accounts instead of the default 20
-      },
+      // Standard configuration for the local network.
     },
-  },
-  paths: {
-    sources: "./contracts",
-    tests: "./test",
-    cache: "./cache",
-    artifacts: "./artifacts",
   },
 };
 

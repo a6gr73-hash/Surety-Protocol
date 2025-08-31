@@ -1,48 +1,24 @@
-// contracts/CollateralVault.sol
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.20;
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
-import "./interfaces/ICollateralVault.sol";
 
-/**
- * @title CollateralVault
- * @author FSP Architect
- * @notice A secure vault for users to deposit and manage SRT and USDC collateral.
- * @dev This contract holds all user funds for the Finite Settlement Protocol. It allows
- * a whitelist of authorized 'settlement contracts' (e.g., FiniteSettlement, WatcherRegistry)
- * to lock, release, and slash collateral based on protocol rules. Direct deposits and
- * withdrawals of free (unlocked) stake are initiated by users themselves.
- */
-contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
-    using SafeERC20 for IERC20;
+contract CollateralVault is ReentrancyGuard, Ownable {
+    IERC20 public immutable SRT;
+    IERC20 public immutable USDC;
 
-    // --- State Variables ---
+    address public settlementContract;
 
-    /// @notice The immutable address of the Surety (SRT) token contract.
-    IERC20 public immutable srt;
-    /// @notice The immutable address of the USDC token contract.
-    IERC20 public immutable usdc;
-
-    /// @notice A mapping that defines the whitelist of authorized settlement contracts.
-    mapping(address => bool) public isSettlementContract;
-
-    /// @notice Mapping from a user's address to their free (unlocked) SRT balance.
     mapping(address => uint256) public srtStake;
-    /// @notice Mapping from a user's address to their locked SRT balance.
     mapping(address => uint256) public srtLocked;
-    /// @notice Mapping from a user's address to their free (unlocked) USDC balance.
     mapping(address => uint256) public usdcStake;
-    /// @notice Mapping from a user's address to their locked USDC balance.
     mapping(address => uint256) public usdcLocked;
+    mapping(address => uint256) public srtStakeTimestamp;
 
     // --- Events ---
-
-    event SettlementContractAdded(address indexed contractAddress);
-    event SettlementContractRemoved(address indexed contractAddress);
+    event SettlementContractSet(address indexed contractAddress);
     event DepositedSRT(address indexed user, uint256 amount);
     event WithdrawnSRT(address indexed user, uint256 amount);
     event LockedSRT(address indexed user, uint256 amount);
@@ -62,158 +38,55 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         uint256 amount
     );
 
-    // --- Modifiers ---
-
-    /**
-     * @dev Throws if the caller is not an authorized settlement contract.
-     */
     modifier onlySettlement() {
-        require(
-            isSettlementContract[msg.sender],
-            "CollateralVault: Caller is not an authorized settlement contract"
-        );
+        require(msg.sender == settlementContract, "not settlement");
         _;
     }
 
     // --- Constructor ---
-
     constructor(address _srt, address _usdc) {
-        require(
-            _srt != address(0),
-            "CollateralVault: SRT address cannot be zero"
-        );
-        require(
-            _usdc != address(0),
-            "CollateralVault: USDC address cannot be zero"
-        );
-        srt = IERC20(_srt);
-        usdc = IERC20(_usdc);
+        require(_srt != address(0), "SRT=0");
+        require(_usdc != address(0), "USDC=0");
+        SRT = IERC20(_srt);
+        USDC = IERC20(_usdc);
     }
 
-    // --- Admin Functions ---
-
-    /**
-     * @notice Adds a contract address to the settlement authorization whitelist.
-     * @dev Can only be called by the contract owner.
-     * @param _contractAddress The address of the settlement contract to authorize.
-     */
-    function addSettlementContract(
-        address _contractAddress
-    ) external onlyOwner {
-        require(
-            _contractAddress != address(0),
-            "CollateralVault: Contract address cannot be zero"
-        );
-        require(
-            !isSettlementContract[_contractAddress],
-            "CollateralVault: Contract already authorized"
-        );
-        isSettlementContract[_contractAddress] = true;
-        emit SettlementContractAdded(_contractAddress);
+    // --- Admin ---
+    function setSettlementContract(address _settlement) external onlyOwner {
+        require(_settlement != address(0), "settlement=0");
+        settlementContract = _settlement;
+        emit SettlementContractSet(_settlement);
     }
 
-    /**
-     * @notice Removes a contract address from the settlement authorization whitelist.
-     * @dev Can only be called by the contract owner.
-     * @param _contractAddress The address of the settlement contract to de-authorize.
-     */
-    function removeSettlementContract(
-        address _contractAddress
-    ) external onlyOwner {
-        require(
-            isSettlementContract[_contractAddress],
-            "CollateralVault: Contract not authorized"
-        );
-        isSettlementContract[_contractAddress] = false;
-        emit SettlementContractRemoved(_contractAddress);
-    }
-
-    // --- User Deposit/Withdraw Functions ---
-
-    /**
-     * @notice Deposits SRT into the vault, adding to the user's free stake.
-     * @param amount The amount of SRT to deposit.
-     */
+    // --- SRT functions ---
     function depositSRT(uint256 amount) external nonReentrant {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
+        require(amount > 0, "amount=0");
+        if (srtStake[msg.sender] == 0 && srtLocked[msg.sender] == 0) {
+            srtStakeTimestamp[msg.sender] = block.timestamp;
+        }
         srtStake[msg.sender] += amount;
-        srt.safeTransferFrom(msg.sender, address(this), amount);
+        require(
+            SRT.transferFrom(msg.sender, address(this), amount),
+            "transferFrom failed"
+        );
         emit DepositedSRT(msg.sender, amount);
     }
 
-    /**
-     * @notice Withdraws free SRT from the vault.
-     * @dev Fails if the user tries to withdraw more than their free `srtStake`.
-     * @param amount The amount of SRT to withdraw.
-     */
     function withdrawSRT(uint256 amount) external nonReentrant {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 currentStake = srtStake[msg.sender];
-        require(
-            currentStake >= amount,
-            "CollateralVault: Insufficient free SRT stake"
-        );
-        srtStake[msg.sender] = currentStake - amount;
-        srt.safeTransfer(msg.sender, amount);
+        require(amount > 0, "amount=0");
+        require(srtStake[msg.sender] >= amount, "insufficient SRT");
+        srtStake[msg.sender] -= amount;
+        require(SRT.transfer(msg.sender, amount), "transfer failed");
         emit WithdrawnSRT(msg.sender, amount);
     }
-
-    /**
-     * @notice Deposits USDC into the vault, adding to the user's free stake.
-     * @param amount The amount of USDC to deposit.
-     */
-    function depositUSDC(uint256 amount) external nonReentrant {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        usdcStake[msg.sender] += amount;
-        usdc.safeTransferFrom(msg.sender, address(this), amount);
-        emit DepositedUSDC(msg.sender, amount);
-    }
-
-    /**
-     * @notice Withdraws free USDC from the vault.
-     * @dev Fails if the user tries to withdraw more than their free `usdcStake`.
-     * @param amount The amount of USDC to withdraw.
-     */
-    function withdrawUSDC(uint256 amount) external nonReentrant {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 currentStake = usdcStake[msg.sender];
-        require(
-            currentStake >= amount,
-            "CollateralVault: Insufficient free USDC stake"
-        );
-        usdcStake[msg.sender] = currentStake - amount;
-        usdc.safeTransfer(msg.sender, amount);
-        emit WithdrawnUSDC(msg.sender, amount);
-    }
-
-    // --- Settlement Contract Functions ---
 
     function lockSRT(
         address user,
         uint256 amount
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 userStake = srtStake[user];
-        require(
-            userStake >= amount,
-            "CollateralVault: Insufficient free SRT to lock"
-        );
-        srtStake[user] = userStake - amount;
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(srtStake[user] >= amount, "insufficient free");
+        srtStake[user] -= amount;
         srtLocked[user] += amount;
         emit LockedSRT(user, amount);
     }
@@ -221,17 +94,10 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     function releaseSRT(
         address user,
         uint256 amount
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 userLocked = srtLocked[user];
-        require(
-            userLocked >= amount,
-            "CollateralVault: Insufficient locked SRT to release"
-        );
-        srtLocked[user] = userLocked - amount;
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(srtLocked[user] >= amount, "insufficient locked");
+        srtLocked[user] -= amount;
         srtStake[user] += amount;
         emit ReleasedSRT(user, amount);
     }
@@ -240,39 +106,41 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         address user,
         uint256 amount,
         address recipient
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        require(
-            recipient != address(0),
-            "CollateralVault: Recipient address cannot be zero"
-        );
-        uint256 userLocked = srtLocked[user];
-        require(
-            userLocked >= amount,
-            "CollateralVault: Insufficient locked SRT to slash"
-        );
-        srtLocked[user] = userLocked - amount;
-        srt.safeTransfer(recipient, amount);
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(recipient != address(0), "recipient=0");
+        require(srtLocked[user] >= amount, "insufficient locked");
+        srtLocked[user] -= amount;
+        require(SRT.transfer(recipient, amount), "slash transfer failed");
         emit SlashedSRT(user, recipient, amount);
+    }
+
+    // --- USDC functions ---
+    function depositUSDC(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        usdcStake[msg.sender] += amount;
+        require(
+            USDC.transferFrom(msg.sender, address(this), amount),
+            "transferFrom failed"
+        );
+        emit DepositedUSDC(msg.sender, amount);
+    }
+
+    function withdrawUSDC(uint256 amount) external nonReentrant {
+        require(amount > 0, "amount=0");
+        require(usdcStake[msg.sender] >= amount, "insufficient USDC");
+        usdcStake[msg.sender] -= amount;
+        require(USDC.transfer(msg.sender, amount), "transfer failed");
+        emit WithdrawnUSDC(msg.sender, amount);
     }
 
     function lockUSDC(
         address user,
         uint256 amount
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 userStake = usdcStake[user];
-        require(
-            userStake >= amount,
-            "CollateralVault: Insufficient free USDC to lock"
-        );
-        usdcStake[user] = userStake - amount;
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(usdcStake[user] >= amount, "insufficient free");
+        usdcStake[user] -= amount;
         usdcLocked[user] += amount;
         emit LockedUSDC(user, amount);
     }
@@ -280,17 +148,10 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
     function releaseUSDC(
         address user,
         uint256 amount
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        uint256 userLocked = usdcLocked[user];
-        require(
-            userLocked >= amount,
-            "CollateralVault: Insufficient locked USDC to release"
-        );
-        usdcLocked[user] = userLocked - amount;
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(usdcLocked[user] >= amount, "insufficient locked");
+        usdcLocked[user] -= amount;
         usdcStake[user] += amount;
         emit ReleasedUSDC(user, amount);
     }
@@ -299,56 +160,47 @@ contract CollateralVault is ICollateralVault, ReentrancyGuard, Ownable {
         address user,
         uint256 amount,
         address recipient
-    ) external override nonReentrant onlySettlement {
-        require(
-            amount > 0,
-            "CollateralVault: Amount must be greater than zero"
-        );
-        require(
-            recipient != address(0),
-            "CollateralVault: Recipient address cannot be zero"
-        );
-        uint256 userLocked = usdcLocked[user];
-        require(
-            userLocked >= amount,
-            "CollateralVault: Insufficient locked USDC to slash"
-        );
-        usdcLocked[user] = userLocked - amount;
-        usdc.safeTransfer(recipient, amount);
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(recipient != address(0), "recipient=0");
+        require(usdcLocked[user] >= amount, "insufficient locked");
+        usdcLocked[user] -= amount;
+        require(USDC.transfer(recipient, amount), "slash transfer failed");
         emit SlashedUSDC(user, recipient, amount);
     }
 
-    // --- View Functions ---
-
-    function srtFreeOf(address user) external view returns (uint256) {
-        return srtStake[user];
+    // --- CORRECTED REIMBURSEMENT FUNCTIONS ---
+    function reimburseAndStakeSRT(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(
+            SRT.transferFrom(msg.sender, address(this), amount),
+            "Reimbursement transfer failed"
+        );
+        srtStake[user] += amount;
+        emit DepositedSRT(user, amount);
     }
 
-    function srtLockedOf(address user) external view returns (uint256) {
-        return srtLocked[user];
+    function reimburseAndStakeUSDC(
+        address user,
+        uint256 amount
+    ) external nonReentrant onlySettlement {
+        require(amount > 0, "amount=0");
+        require(
+            USDC.transferFrom(msg.sender, address(this), amount),
+            "Reimbursement transfer failed"
+        );
+        usdcStake[user] += amount;
+        emit DepositedUSDC(user, amount);
     }
 
+    // --- Views ---
     function srtTotalOf(address user) external view returns (uint256) {
         return srtStake[user] + srtLocked[user];
     }
 
-    /**
-     * @notice Returns a user's free USDC balance.
-     */
-    function usdcFreeOf(address user) external view returns (uint256) {
-        return usdcStake[user];
-    }
-
-    /**
-     * @notice Returns a user's locked USDC balance.
-     */
-    function usdcLockedOf(address user) external view returns (uint256) {
-        return usdcLocked[user];
-    }
-
-    /**
-     * @notice Returns a user's total (free + locked) USDC balance.
-     */
     function usdcTotalOf(address user) external view returns (uint256) {
         return usdcStake[user] + usdcLocked[user];
     }
